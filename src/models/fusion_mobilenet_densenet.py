@@ -10,14 +10,16 @@ def create_fusion_mobilenet_densenet(num_classes=1, pretrained=True):
     mobilenet = models.mobilenet_v2(
         weights=models.MobileNet_V2_Weights.DEFAULT if pretrained else None
     )
+    mobilenet_dim = mobilenet.last_channel
     mobilenet.classifier = nn.Identity()
 
     densenet = models.densenet121(
         weights=models.DenseNet121_Weights.DEFAULT if pretrained else None
     )
+    densenet_dim = densenet.classifier.in_features
     densenet.classifier = nn.Identity()
 
-    fusion_dim = mobilenet.last_channel + densenet.classifier.in_features
+    fusion_dim = mobilenet_dim + densenet_dim
 
     model = FusionMobileNetDenseNet(mobilenet, densenet, fusion_dim)
     return model, "head"
