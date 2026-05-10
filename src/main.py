@@ -9,7 +9,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from src.data.dataset import ThyroidDataset, CLASS_NAMES, NUM_CLASSES, create_splits
 from src.data.preprocess import get_train_transforms, get_val_transforms
@@ -17,6 +16,7 @@ from src.models.mobilenetv2 import create_mobilenetv2
 from src.models.resnet50 import create_resnet50
 from src.models.densenet import create_densenet121
 from src.models.efficientnet import create_efficientnet_b0
+from src.losses import FocalLoss, WeightedBCEWithLogitsLoss
 from src.train import train_model
 from src.evaluate import evaluate_all_splits
 
@@ -92,6 +92,9 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--loss", type=str, default="focal",
+                        choices=["focal", "bce"],
+                        help="Loss function: focal or bce")
     parser.add_argument("--freeze-epochs", type=int, default=5,
                         help="Epochs to train with frozen backbone (stage 1)")
     parser.add_argument("--img-size", type=int, default=224)
@@ -113,7 +116,7 @@ def main():
         args.data_dir, args.batch_size, args.img_size, args.num_workers, args.seed
     )
 
-    print(f"\nModel: {args.model} | Batch: {args.batch_size} | Epochs: {args.epochs} | LR: {args.lr}")
+    print(f"\nModel: {args.model} | Loss: {args.loss} | Batch: {args.batch_size} | Epochs: {args.epochs} | LR: {args.lr}")
     print(f"Freeze epochs: {args.freeze_epochs} | Stage 2 epochs: {args.epochs - args.freeze_epochs}")
 
     model, head_name = MODEL_REGISTRY[args.model](num_classes=NUM_CLASSES, pretrained=True)
@@ -125,7 +128,12 @@ def main():
         [total / (NUM_CLASSES * class_counts[i]) for i in range(NUM_CLASSES)],
         dtype=torch.float32,
     ).to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+    if args.loss == "focal":
+        criterion = FocalLoss(alpha=class_weights, gamma=2.0)
+    else:
+        criterion = WeightedBCEWithLogitsLoss(class_weights=class_weights)
+
     print(f"Class weights: {class_weights.cpu().tolist()} (Benign={class_counts[0]}, Malignant={class_counts[1]})")
 
     model_save_dir = os.path.join(args.output_dir, "models", args.model)
