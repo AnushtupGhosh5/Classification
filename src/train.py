@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import torch.nn as nn
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 from src.utils import evaluate_model, compute_metrics
 
@@ -39,7 +39,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes
         optimizer.step()
 
         running_loss += loss.item() * images.size(0)
-        preds = outputs.argmax(dim=1)
+        preds = (outputs.squeeze(dim=1) > 0).long()
         all_preds.extend(preds.detach().cpu().numpy())
         all_labels.extend(labels.cpu().numpy())
 
@@ -83,6 +83,7 @@ def train_model(
         freeze_backbone(model, head_name)
         head = getattr(model, head_name)
         stage1_optimizer = torch.optim.Adam(head.parameters(), lr=lr)
+        stage1_scheduler = ReduceLROnPlateau(stage1_optimizer, mode="max", factor=0.5, patience=3, min_lr=1e-7)
 
         for epoch in range(1, freeze_epochs + 1):
             print(f"\nEpoch {epoch}/{num_epochs} [Stage 1 - Frozen]")
@@ -90,6 +91,8 @@ def train_model(
             train_metrics = train_one_epoch(model, train_loader, criterion, stage1_optimizer, device, num_classes)
             val_metrics = evaluate_model(model, val_loader, criterion, device, num_classes)
             test_metrics = evaluate_model(model, test_loader, criterion, device, num_classes)
+
+            stage1_scheduler.step(val_metrics["f1"])
 
             history["train"].append({"epoch": epoch, **train_metrics})
             history["val"].append({"epoch": epoch, **val_metrics})
@@ -128,7 +131,7 @@ def train_model(
             {"params": backbone_params, "lr": lr / 10},
             {"params": head_params_list, "lr": lr},
         ])
-        scheduler = CosineAnnealingLR(stage2_optimizer, T_max=stage2_epochs, eta_min=1e-6)
+        scheduler = ReduceLROnPlateau(stage2_optimizer, mode="max", factor=0.5, patience=3, min_lr=1e-7)
 
         for epoch in range(freeze_epochs + 1, num_epochs + 1):
             print(f"\nEpoch {epoch}/{num_epochs} [Stage 2 - Fine-tune]")
@@ -137,7 +140,7 @@ def train_model(
             val_metrics = evaluate_model(model, val_loader, criterion, device, num_classes)
             test_metrics = evaluate_model(model, test_loader, criterion, device, num_classes)
 
-            scheduler.step()
+            scheduler.step(val_metrics["f1"])
 
             history["train"].append({"epoch": epoch, **train_metrics})
             history["val"].append({"epoch": epoch, **val_metrics})
