@@ -16,6 +16,7 @@ from src.models.mobilenetv2 import create_mobilenetv2
 from src.models.resnet50 import create_resnet50
 from src.models.densenet import create_densenet121
 from src.models.efficientnet import create_efficientnet_b0
+from src.models.fusion_mobilenet_densenet import create_fusion_mobilenet_densenet
 from src.losses import FocalLoss, WeightedBCEWithLogitsLoss
 from src.train import train_model
 from src.evaluate import evaluate_all_splits
@@ -26,6 +27,7 @@ MODEL_REGISTRY = {
     "resnet50": create_resnet50,
     "densenet121": create_densenet121,
     "efficientnet_b0": create_efficientnet_b0,
+    "mobilenet_densenet_fusion": create_fusion_mobilenet_densenet,
 }
 
 
