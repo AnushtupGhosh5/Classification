@@ -7,6 +7,6 @@ def create_resnet50(num_classes=2, pretrained=True):
     model.fc = nn.Sequential(
     nn.BatchNorm1d(model.fc.in_features),
     nn.Dropout(0.4),
-    nn.Linear(model.fc.in_features, num_classes)
+    nn.Linear(model.fc.in_features, 1)
 )
     return model, "fc"
