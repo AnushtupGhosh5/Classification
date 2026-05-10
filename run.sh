@@ -4,7 +4,7 @@ set -e
 IMAGE_NAME="thyroid-classification"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-DATA_DIR="$PROJECT_DIR/data/UltraSonography_Thryroid_Nodules"
+DATA_DIR="$PROJECT_DIR/data/TN5000/TN5000_forReview/TN5000_forReview"
 SRC_DIR="$PROJECT_DIR/src"
 OUTPUT_DIR="$PROJECT_DIR/outputs"
 

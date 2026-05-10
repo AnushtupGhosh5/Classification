@@ -97,7 +97,7 @@ def main():
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--data-dir", type=str,
                         default="/app/data/dataset",
-                        help="Path to dataset root (contains batch1_image/, batch2_image/)")
+                        help="Path to TN5000 VOC dataset root (contains JPEGImages/, Annotations/, ImageSets/)")
     parser.add_argument("--output-dir", type=str, default="/app/outputs")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
