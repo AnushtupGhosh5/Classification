@@ -20,6 +20,8 @@ from src.models.resnet50 import create_resnet50
 from src.models.resnet101 import create_resnet101
 from src.models.densenet import create_densenet121
 from src.models.efficientnet import create_efficientnet_b0, create_efficientnet_b1, create_efficientnet_b2
+from src.models.squeezenet import create_squeezenet1_0, create_squeezenet1_1
+from src.models.vgg import create_vgg16
 from src.models.fusion_mobilenet_densenet import create_fusion_mobilenet_densenet
 from src.losses import FocalLoss
 from src.train import train_model
@@ -37,6 +39,9 @@ MODEL_REGISTRY = {
     "efficientnet_b0": create_efficientnet_b0,
     "efficientnet_b1": create_efficientnet_b1,
     "efficientnet_b2": create_efficientnet_b2,
+    "squeezenet1_0": create_squeezenet1_0,
+    "squeezenet1_1": create_squeezenet1_1,
+    "vgg16": create_vgg16,
     "mobilenet_densenet_fusion": create_fusion_mobilenet_densenet,
 }
 
