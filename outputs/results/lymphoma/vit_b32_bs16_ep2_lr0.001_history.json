@@ -1,0 +1,62 @@
+{
+  "train": [
+    {
+      "epoch": 1,
+      "accuracy": 0.341,
+      "precision": 0.3409,
+      "recall": 0.3418,
+      "f1": 0.3408,
+      "specificity": 0.6701,
+      "loss": 1.115
+    },
+    {
+      "epoch": 2,
+      "accuracy": 0.3448,
+      "precision": 0.3386,
+      "recall": 0.342,
+      "f1": 0.3394,
+      "specificity": 0.6726,
+      "loss": 0.4882
+    }
+  ],
+  "val": [
+    {
+      "epoch": 1,
+      "accuracy": 0.3036,
+      "precision": 0.2222,
+      "recall": 0.3221,
+      "f1": 0.2126,
+      "specificity": 0.6618,
+      "loss": 0.5245
+    },
+    {
+      "epoch": 2,
+      "accuracy": 0.4821,
+      "precision": 0.3214,
+      "recall": 0.4577,
+      "f1": 0.3771,
+      "specificity": 0.7366,
+      "loss": 0.4613
+    }
+  ],
+  "test": [
+    {
+      "epoch": 1,
+      "accuracy": 0.2807,
+      "precision": 0.0952,
+      "recall": 0.3137,
+      "f1": 0.1461,
+      "specificity": 0.6574,
+      "loss": 0.5364
+    },
+    {
+      "epoch": 2,
+      "accuracy": 0.4035,
+      "precision": 0.2716,
+      "recall": 0.3818,
+      "f1": 0.3166,
+      "specificity": 0.6949,
+      "loss": 0.4584
+    }
+  ]
+}
