@@ -130,7 +130,7 @@ def train_model(
     if skip_freeze:
         unfreeze_all(model)
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-        scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-7)
+        scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=15, min_lr=1e-7)
 
         for epoch in range(1, num_epochs + 1):
             best_val_loss = _run_epoch(
@@ -144,7 +144,7 @@ def train_model(
             freeze_backbone(model, head_name)
             head = getattr(model, head_name)
             stage1_optimizer = torch.optim.Adam(head.parameters(), lr=lr)
-            stage1_scheduler = ReduceLROnPlateau(stage1_optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-7)
+            stage1_scheduler = ReduceLROnPlateau(stage1_optimizer, mode="min", factor=0.5, patience=15, min_lr=1e-7)
 
             for epoch in range(1, freeze_epochs + 1):
                 best_val_loss = _run_epoch(
@@ -168,7 +168,7 @@ def train_model(
                 {"params": backbone_params, "lr": lr / 10},
                 {"params": head_params_list, "lr": lr},
             ])
-            scheduler = ReduceLROnPlateau(stage2_optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-7)
+            scheduler = ReduceLROnPlateau(stage2_optimizer, mode="min", factor=0.5, patience=15, min_lr=1e-7)
 
             for epoch in range(freeze_epochs + 1, num_epochs + 1):
                 best_val_loss = _run_epoch(
