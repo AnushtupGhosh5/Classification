@@ -1,93 +1,105 @@
 import os
-import xml.etree.ElementTree as ET
 from PIL import Image
 from torch.utils.data import Dataset
-
-CLASS_NAMES = ["Benign", "Malignant"]
-NUM_CLASSES = 2
+from sklearn.model_selection import train_test_split
 
 
-def parse_voc_annotation(xml_path):
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
-    obj = root.find("object")
-    label = int(obj.find("name").text)
-    bbox = obj.find("bndbox")
-    xmin = int(bbox.find("xmin").text)
-    ymin = int(bbox.find("ymin").text)
-    xmax = int(bbox.find("xmax").text)
-    ymax = int(bbox.find("ymax").text)
-    return label, (xmin, ymin, xmax, ymax)
+VALID_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 
-def crop_with_padding(image, bbox, padding_ratio=0.1):
-    w, h = image.size
-    xmin, ymin, xmax, ymax = bbox
-    bw = xmax - xmin
-    bh = ymax - ymin
-    pad_w = int(bw * padding_ratio)
-    pad_h = int(bh * padding_ratio)
-    xmin = max(0, xmin - pad_w)
-    ymin = max(0, ymin - pad_h)
-    xmax = min(w, xmax + pad_w)
-    ymax = min(h, ymax + pad_h)
-    return image.crop((xmin, ymin, xmax, ymax))
+def _discover_samples(root_dir, class_names=None):
+    if class_names is None:
+        class_names = sorted([
+            d for d in os.listdir(root_dir)
+            if os.path.isdir(os.path.join(root_dir, d))
+        ])
+
+    class_to_idx = {name: idx for idx, name in enumerate(class_names)}
+    samples = []
+
+    for class_name in class_names:
+        class_dir = os.path.join(root_dir, class_name)
+        if not os.path.isdir(class_dir):
+            continue
+        label = class_to_idx[class_name]
+        for fname in sorted(os.listdir(class_dir)):
+            ext = os.path.splitext(fname)[1].lower()
+            if ext in VALID_EXTENSIONS:
+                samples.append((os.path.join(class_dir, fname), label))
+
+    return samples, class_to_idx
 
 
-def create_splits(data_dir, bbox_padding=0.1, seed=42):
-    jpeg_dir = os.path.join(data_dir, "JPEGImages")
-    anno_dir = os.path.join(data_dir, "Annotations")
-    splits_dir = os.path.join(data_dir, "ImageSets", "Main")
+def create_splits(data_dir, num_classes, class_names=None, has_predefined_splits=False, seed=42):
+    if has_predefined_splits:
+        return _create_predefined_splits(data_dir, class_names, seed)
+    return _create_random_splits(data_dir, num_classes, class_names, seed)
 
-    splits = {}
-    for split_name in ["train", "val", "test"]:
-        split_file = os.path.join(splits_dir, f"{split_name}.txt")
-        samples = []
-        with open(split_file, "r") as f:
-            for line in f:
-                img_id = line.strip()
-                if not img_id:
-                    continue
-                img_path = os.path.join(jpeg_dir, f"{img_id}.jpg")
-                xml_path = os.path.join(anno_dir, f"{img_id}.xml")
-                if not os.path.exists(img_path) or not os.path.exists(xml_path):
-                    continue
-                label, bbox = parse_voc_annotation(xml_path)
-                samples.append((img_path, label, bbox))
-        splits[split_name] = samples
 
-    train_samples = splits["train"]
-    val_samples = splits["val"]
-    test_samples = splits["test"]
+def _create_random_splits(data_dir, num_classes, class_names, seed):
+    samples, class_to_idx = _discover_samples(data_dir, class_names)
 
-    for split_name, samples in [("Train", train_samples), ("Val", val_samples), ("Test", test_samples)]:
-        counts = {0: 0, 1: 0}
-        for _, label, _ in samples:
-            counts[label] += 1
-        print(f"  {split_name}: {len(samples)} images | Benign: {counts[0]}, Malignant: {counts[1]}")
+    labels = [s[1] for s in samples]
+    train_val, test_samples = train_test_split(
+        samples, test_size=0.15, random_state=seed, stratify=labels,
+    )
+    train_val_labels = [s[1] for s in train_val]
+    train_samples, val_samples = train_test_split(
+        train_val, test_size=0.176, random_state=seed, stratify=train_val_labels,
+    )
+
+    _print_split_counts("Train", train_samples, num_classes)
+    _print_split_counts("Val", val_samples, num_classes)
+    _print_split_counts("Test", test_samples, num_classes)
 
     return train_samples, val_samples, test_samples
 
 
-class ThyroidDataset(Dataset):
-    def __init__(self, samples, transform=None, bbox_padding=0.1):
+def _create_predefined_splits(data_dir, class_names, seed):
+    train_dir = os.path.join(data_dir, "Train")
+    test_dir = os.path.join(data_dir, "Test-A")
+
+    train_all, _ = _discover_samples(train_dir, class_names)
+    test_samples, _ = _discover_samples(test_dir, class_names)
+
+    train_labels = [s[1] for s in train_all]
+    train_samples, val_samples = train_test_split(
+        train_all, test_size=0.2, random_state=seed, stratify=train_labels,
+    )
+
+    num_classes = len(class_names)
+    _print_split_counts("Train", train_samples, num_classes)
+    _print_split_counts("Val", val_samples, num_classes)
+    _print_split_counts("Test", test_samples, num_classes)
+
+    return train_samples, val_samples, test_samples
+
+
+def _print_split_counts(split_name, samples, num_classes):
+    counts = {i: 0 for i in range(num_classes)}
+    for _, label in samples:
+        counts[label] = counts.get(label, 0) + 1
+    parts = [f"class{i}: {counts.get(i, 0)}" for i in range(num_classes)]
+    print(f"  {split_name}: {len(samples)} images | {', '.join(parts)}")
+
+
+class FolderDataset(Dataset):
+    def __init__(self, samples, transform=None):
         self.samples = samples
         self.transform = transform
-        self.bbox_padding = bbox_padding
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        img_path, label, bbox = self.samples[idx]
+        img_path, label = self.samples[idx]
         image = Image.open(img_path).convert("RGB")
-        image = crop_with_padding(image, bbox, self.bbox_padding)
         if self.transform:
             image = self.transform(image)
         return image, label
 
     def get_class_counts(self):
-        counts = {0: 0, 1: 0}
-        for _, label, _ in self.samples:
-            counts[label] += 1
+        counts = {}
+        for _, label in self.samples:
+            counts[label] = counts.get(label, 0) + 1
         return counts

@@ -4,7 +4,7 @@ set -e
 IMAGE_NAME="thyroid-classification"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-DATA_DIR="$PROJECT_DIR/data/TN5000/TN5000_forReview/TN5000_forReview"
+DATA_DIR="$PROJECT_DIR/data"
 SRC_DIR="$PROJECT_DIR/src"
 OUTPUT_DIR="$PROJECT_DIR/outputs"
 
@@ -18,8 +18,8 @@ echo "Args:  $@"
 echo ""
 
 docker run --rm --gpus all --shm-size=8g \
+    -v "$DATA_DIR:/app/data" \
     -v "$SRC_DIR:/app/src" \
-    -v "$DATA_DIR:/app/data/dataset" \
     -v "$OUTPUT_DIR:/app/outputs" \
     "$IMAGE_NAME" \
-    python src/main.py "$@"
+    python src/main.py --output-dir /app/outputs "$@"

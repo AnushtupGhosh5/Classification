@@ -56,7 +56,7 @@ def evaluate_model(model, dataloader, criterion, device, num_classes):
         total_loss += loss.item() * images.size(0)
         total_samples += images.size(0)
 
-        preds = (outputs.squeeze(dim=1) > 0).long()
+        preds = outputs.argmax(dim=1)
         all_preds.extend(preds.cpu().numpy())
         all_labels.extend(labels.cpu().numpy())
 

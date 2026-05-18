@@ -39,7 +39,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes
         optimizer.step()
 
         running_loss += loss.item() * images.size(0)
-        preds = (outputs.squeeze(dim=1) > 0).long()
+        preds = outputs.argmax(dim=1)
         all_preds.extend(preds.detach().cpu().numpy())
         all_labels.extend(labels.cpu().numpy())
 

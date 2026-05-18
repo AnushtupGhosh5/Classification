@@ -10,14 +10,15 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from src.data.dataset import ThyroidDataset, CLASS_NAMES, NUM_CLASSES, create_splits
+from src.data.dataset_config import get_dataset_config
+from src.data.dataset import FolderDataset, create_splits
 from src.data.preprocess import get_train_transforms, get_val_transforms
 from src.models.mobilenetv2 import create_mobilenetv2
 from src.models.resnet50 import create_resnet50
 from src.models.densenet import create_densenet121
 from src.models.efficientnet import create_efficientnet_b0
 from src.models.fusion_mobilenet_densenet import create_fusion_mobilenet_densenet
-from src.losses import FocalLoss, WeightedBCEWithLogitsLoss
+from src.losses import FocalLoss
 from src.train import train_model
 from src.evaluate import evaluate_all_splits
 
@@ -30,13 +31,18 @@ MODEL_REGISTRY = {
     "mobilenet_densenet_fusion": create_fusion_mobilenet_densenet,
 }
 
+ATTENTION_CHOICES = ["none", "se", "cbam", "eca"]
 
-def get_data_loaders(data_dir, batch_size, img_size=224, num_workers=4, seed=42):
-    train_samples, val_samples, test_samples = create_splits(data_dir, seed=seed)
 
-    train_dataset = ThyroidDataset(train_samples, transform=get_train_transforms(img_size))
-    val_dataset = ThyroidDataset(val_samples, transform=get_val_transforms(img_size))
-    test_dataset = ThyroidDataset(test_samples, transform=get_val_transforms(img_size))
+def get_data_loaders(data_dir, num_classes, class_names, has_predefined_splits, batch_size, img_size=224, num_workers=4, seed=42):
+    train_samples, val_samples, test_samples = create_splits(
+        data_dir, num_classes, class_names=class_names,
+        has_predefined_splits=has_predefined_splits, seed=seed,
+    )
+
+    train_dataset = FolderDataset(train_samples, transform=get_train_transforms(img_size))
+    val_dataset = FolderDataset(val_samples, transform=get_val_transforms(img_size))
+    test_dataset = FolderDataset(test_samples, transform=get_val_transforms(img_size))
 
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
@@ -54,7 +60,7 @@ def get_data_loaders(data_dir, batch_size, img_size=224, num_workers=4, seed=42)
     return train_loader, val_loader, test_loader
 
 
-def save_results_csv(results, filepath, model_name, batch_size, epochs, lr):
+def save_results_csv(results, filepath, model_name, dataset_name, attention, batch_size, epochs, lr):
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
     rows = []
@@ -62,6 +68,8 @@ def save_results_csv(results, filepath, model_name, batch_size, epochs, lr):
         if split in results:
             row = {
                 "model": model_name,
+                "dataset": dataset_name,
+                "attention": attention,
                 "batch_size": batch_size,
                 "epochs": epochs,
                 "lr": lr,
@@ -87,59 +95,76 @@ def save_history_json(history, filepath):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Thyroid Ultrasound Nodule Classification")
+    parser = argparse.ArgumentParser(description="Image Classification Pipeline")
+    parser.add_argument("--dataset", type=str, required=True,
+                        choices=["all4", "lymphoma", "pbc8", "raabin"],
+                        help="Dataset to use")
     parser.add_argument("--model", type=str, required=True,
                         choices=list(MODEL_REGISTRY.keys()),
                         help="Model architecture")
+    parser.add_argument("--attention", type=str, default="none",
+                        choices=ATTENTION_CHOICES,
+                        help="Attention mechanism: none, se (SEBlock), cbam, eca")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--loss", type=str, default="focal",
-                        choices=["focal", "bce"],
-                        help="Loss function: focal or bce")
+                        choices=["focal", "ce"],
+                        help="Loss function: focal or ce (cross-entropy)")
     parser.add_argument("--freeze-epochs", type=int, default=5,
                         help="Epochs to train with frozen backbone (stage 1)")
     parser.add_argument("--img-size", type=int, default=224)
-    parser.add_argument("--data-dir", type=str,
-                        default="/app/data/dataset",
-                        help="Path to TN5000 VOC dataset root (contains JPEGImages/, Annotations/, ImageSets/)")
-    parser.add_argument("--output-dir", type=str, default="/app/outputs")
+    parser.add_argument("--output-dir", type=str, default="outputs")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+
+    config = get_dataset_config(args.dataset)
+    data_dir = config["data_dir"]
+    num_classes = config["num_classes"]
+    class_names = config["class_names"]
+    has_predefined_splits = config["has_predefined_splits"]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    print(f"\nDataset: {args.data_dir}")
+    print(f"\nDataset: {args.dataset} ({data_dir})")
+    print(f"Classes ({num_classes}): {class_names}")
     train_loader, val_loader, test_loader = get_data_loaders(
-        args.data_dir, args.batch_size, args.img_size, args.num_workers, args.seed
+        data_dir, num_classes, class_names, has_predefined_splits,
+        args.batch_size, args.img_size, args.num_workers, args.seed,
     )
 
-    print(f"\nModel: {args.model} | Loss: {args.loss} | Batch: {args.batch_size} | Epochs: {args.epochs} | LR: {args.lr}")
+    print(f"\nModel: {args.model} | Attention: {args.attention} | Loss: {args.loss} | Batch: {args.batch_size} | Epochs: {args.epochs} | LR: {args.lr}")
     print(f"Freeze epochs: {args.freeze_epochs} | Stage 2 epochs: {args.epochs - args.freeze_epochs}")
 
-    model, head_name = MODEL_REGISTRY[args.model](num_classes=NUM_CLASSES, pretrained=True)
+    attention_arg = args.attention if args.attention != "none" else None
+    model, head_name = MODEL_REGISTRY[args.model](
+        num_classes=num_classes, pretrained=True, attention=attention_arg,
+    )
     model = model.to(device)
 
     class_counts = train_loader.dataset.get_class_counts()
     total = sum(class_counts.values())
     class_weights = torch.tensor(
-        [total / (NUM_CLASSES * class_counts[i]) for i in range(NUM_CLASSES)],
+        [total / (num_classes * class_counts.get(i, 1)) for i in range(num_classes)],
         dtype=torch.float32,
     ).to(device)
 
     if args.loss == "focal":
         criterion = FocalLoss(alpha=class_weights, gamma=2.0)
     else:
-        criterion = WeightedBCEWithLogitsLoss(class_weights=class_weights)
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
 
-    print(f"Class weights: {class_weights.cpu().tolist()} (Benign={class_counts[0]}, Malignant={class_counts[1]})")
+    counts_str = ", ".join(f"{class_names[i]}={class_counts.get(i, 0)}" for i in range(num_classes))
+    print(f"Class weights: {class_weights.cpu().tolist()} ({counts_str})")
 
-    model_save_dir = os.path.join(args.output_dir, "models", args.model)
-    results_csv = os.path.join(args.output_dir, "results", "results.csv")
+    attn_suffix = f"_{args.attention}" if args.attention != "none" else ""
+    model_label = f"{args.model}{attn_suffix}"
+    model_save_dir = os.path.join(args.output_dir, "models", args.dataset, model_label)
+    results_csv = os.path.join(args.output_dir, "results", args.dataset, "results.csv")
 
     final_metrics = train_model(
         model=model,
@@ -150,31 +175,32 @@ def main():
         criterion=criterion,
         lr=args.lr,
         device=device,
-        num_classes=NUM_CLASSES,
+        num_classes=num_classes,
         num_epochs=args.epochs,
         freeze_epochs=args.freeze_epochs,
-        model_name=args.model,
+        model_name=model_label,
         save_dir=model_save_dir,
     )
 
-    best_model_path = os.path.join(model_save_dir, f"{args.model}_best.pth")
+    best_model_path = os.path.join(model_save_dir, f"{model_label}_best.pth")
     if os.path.exists(best_model_path):
         print(f"\nLoading best model from {best_model_path}")
         model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
 
     final_results = evaluate_all_splits(
         model, train_loader, val_loader, test_loader,
-        criterion, device, NUM_CLASSES,
+        criterion, device, num_classes,
     )
 
     save_results_csv(
         final_results, results_csv,
-        args.model, args.batch_size, args.epochs, args.lr,
+        args.model, args.dataset, args.attention,
+        args.batch_size, args.epochs, args.lr,
     )
 
     history_path = os.path.join(
-        args.output_dir, "results",
-        f"{args.model}_bs{args.batch_size}_ep{args.epochs}_lr{args.lr}_history.json",
+        args.output_dir, "results", args.dataset,
+        f"{model_label}_bs{args.batch_size}_ep{args.epochs}_lr{args.lr}_history.json",
     )
     save_history_json(final_metrics["history"], history_path)
 

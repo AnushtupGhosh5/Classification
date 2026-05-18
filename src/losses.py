@@ -8,24 +8,51 @@ class FocalLoss(nn.Module):
         super().__init__()
         self.gamma = gamma
         self.reduction = reduction
-        self.register_buffer("alpha", alpha)
+        if alpha is not None:
+            self.register_buffer("alpha", alpha)
 
     def forward(self, logits, targets):
         if logits.dim() == 2 and logits.size(1) == 1:
             logits = logits.squeeze(1)
-        targets = targets.float()
+            return self._binary_forward(logits, targets)
+        if logits.dim() == 2 and logits.size(1) > 1:
+            return self._multiclass_forward(logits, targets)
+        return self._binary_forward(logits.squeeze(), targets)
 
+    def _binary_forward(self, logits, targets):
+        targets = targets.float()
         bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
         probs = torch.sigmoid(logits)
         p_t = probs * targets + (1 - probs) * (1 - targets)
         focal_factor = (1 - p_t) ** self.gamma
 
-        if self.alpha is not None:
+        if hasattr(self, "alpha"):
             alpha = self.alpha.to(logits.device)
             alpha_t = alpha[1] * targets + alpha[0] * (1 - targets)
             loss = alpha_t * focal_factor * bce
         else:
             loss = focal_factor * bce
+
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+    def _multiclass_forward(self, logits, targets):
+        targets = targets.long()
+        log_probs = F.log_softmax(logits, dim=1)
+        probs = torch.exp(log_probs)
+        ce = F.nll_loss(log_probs, targets, reduction="none")
+        pt = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        focal_factor = (1 - pt) ** self.gamma
+
+        if hasattr(self, "alpha"):
+            alpha = self.alpha.to(logits.device)
+            alpha_t = alpha[targets]
+            loss = alpha_t * focal_factor * ce
+        else:
+            loss = focal_factor * ce
 
         if self.reduction == "mean":
             return loss.mean()
