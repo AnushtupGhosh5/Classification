@@ -50,6 +50,51 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes
     return metrics
 
 
+def _save_best(model, save_dir, model_name, val_loss, best_val_loss):
+    save_path = os.path.join(save_dir, f"{model_name}_best.pth")
+    torch.save(model.state_dict(), save_path)
+    return val_loss
+
+
+def _log_epoch(prefix, train_m, val_m, test_m):
+    print(
+        f"  Train - Loss: {train_m['loss']:.4f} | "
+        f"Acc: {train_m['accuracy']:.4f} | F1: {train_m['f1']:.4f}"
+    )
+    print(
+        f"  Val   - Loss: {val_m['loss']:.4f} | "
+        f"Acc: {val_m['accuracy']:.4f} | F1: {val_m['f1']:.4f}"
+    )
+    print(
+        f"  Test  - Loss: {test_m['loss']:.4f} | "
+        f"Acc: {test_m['accuracy']:.4f} | F1: {test_m['f1']:.4f}"
+    )
+
+
+def _run_epoch(epoch, num_epochs, stage_label, model, train_loader, val_loader,
+               test_loader, criterion, optimizer, device, num_classes, scheduler,
+               history, best_val_loss, save_dir, model_name):
+    print(f"\nEpoch {epoch}/{num_epochs} [{stage_label}]")
+
+    train_metrics = train_one_epoch(model, train_loader, criterion, optimizer, device, num_classes)
+    val_metrics = evaluate_model(model, val_loader, criterion, device, num_classes)
+    test_metrics = evaluate_model(model, test_loader, criterion, device, num_classes)
+
+    scheduler.step(val_metrics["loss"])
+
+    history["train"].append({"epoch": epoch, **train_metrics})
+    history["val"].append({"epoch": epoch, **val_metrics})
+    history["test"].append({"epoch": epoch, **test_metrics})
+
+    _log_epoch(stage_label, train_metrics, val_metrics, test_metrics)
+
+    if val_metrics["loss"] < best_val_loss:
+        best_val_loss = _save_best(model, save_dir, model_name, val_metrics["loss"], best_val_loss)
+        print(f"  -> Best model saved (val loss: {best_val_loss:.4f})")
+
+    return best_val_loss
+
+
 def train_model(
     model,
     head_name,
@@ -64,10 +109,11 @@ def train_model(
     freeze_epochs,
     model_name,
     save_dir,
+    skip_freeze=False,
 ):
     os.makedirs(save_dir, exist_ok=True)
 
-    best_val_f1 = 0.0
+    best_val_loss = float("inf")
     history = {
         "train": [],
         "val": [],
@@ -75,101 +121,67 @@ def train_model(
     }
 
     print(f"\n{'='*60}")
-    print(f"Training: {model_name} | Epochs: {num_epochs} (freeze: {freeze_epochs})")
+    if skip_freeze:
+        print(f"Training: {model_name} | Epochs: {num_epochs} (full fine-tune)")
+    else:
+        print(f"Training: {model_name} | Epochs: {num_epochs} (freeze: {freeze_epochs})")
     print(f"{'='*60}")
 
-    if freeze_epochs > 0:
-        print(f"\n--- Stage 1: Frozen backbone ({freeze_epochs} epochs) ---")
-        freeze_backbone(model, head_name)
-        head = getattr(model, head_name)
-        stage1_optimizer = torch.optim.Adam(head.parameters(), lr=lr)
-        stage1_scheduler = ReduceLROnPlateau(stage1_optimizer, mode="max", factor=0.5, patience=3, min_lr=1e-7)
-
-        for epoch in range(1, freeze_epochs + 1):
-            print(f"\nEpoch {epoch}/{num_epochs} [Stage 1 - Frozen]")
-
-            train_metrics = train_one_epoch(model, train_loader, criterion, stage1_optimizer, device, num_classes)
-            val_metrics = evaluate_model(model, val_loader, criterion, device, num_classes)
-            test_metrics = evaluate_model(model, test_loader, criterion, device, num_classes)
-
-            stage1_scheduler.step(val_metrics["f1"])
-
-            history["train"].append({"epoch": epoch, **train_metrics})
-            history["val"].append({"epoch": epoch, **val_metrics})
-            history["test"].append({"epoch": epoch, **test_metrics})
-
-            print(
-                f"  Train - Loss: {train_metrics['loss']:.4f} | "
-                f"Acc: {train_metrics['accuracy']:.4f} | F1: {train_metrics['f1']:.4f}"
-            )
-            print(
-                f"  Val   - Loss: {val_metrics['loss']:.4f} | "
-                f"Acc: {val_metrics['accuracy']:.4f} | F1: {val_metrics['f1']:.4f}"
-            )
-            print(
-                f"  Test  - Loss: {test_metrics['loss']:.4f} | "
-                f"Acc: {test_metrics['accuracy']:.4f} | F1: {test_metrics['f1']:.4f}"
-            )
-
-            if val_metrics["f1"] > best_val_f1:
-                best_val_f1 = val_metrics["f1"]
-                save_path = os.path.join(save_dir, f"{model_name}_best.pth")
-                torch.save(model.state_dict(), save_path)
-                print(f"  -> Best model saved (val F1: {best_val_f1:.4f})")
-
-    stage2_epochs = num_epochs - freeze_epochs
-    if stage2_epochs > 0:
-        print(f"\n--- Stage 2: Fine-tuning all layers ({stage2_epochs} epochs) ---")
+    if skip_freeze:
         unfreeze_all(model)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-7)
 
-        head = getattr(model, head_name)
-        head_params = set(id(p) for p in head.parameters())
-        backbone_params = [p for p in model.parameters() if id(p) not in head_params]
-        head_params_list = list(head.parameters())
-
-        stage2_optimizer = torch.optim.Adam([
-            {"params": backbone_params, "lr": lr / 10},
-            {"params": head_params_list, "lr": lr},
-        ])
-        scheduler = ReduceLROnPlateau(stage2_optimizer, mode="max", factor=0.5, patience=3, min_lr=1e-7)
-
-        for epoch in range(freeze_epochs + 1, num_epochs + 1):
-            print(f"\nEpoch {epoch}/{num_epochs} [Stage 2 - Fine-tune]")
-
-            train_metrics = train_one_epoch(model, train_loader, criterion, stage2_optimizer, device, num_classes)
-            val_metrics = evaluate_model(model, val_loader, criterion, device, num_classes)
-            test_metrics = evaluate_model(model, test_loader, criterion, device, num_classes)
-
-            scheduler.step(val_metrics["f1"])
-
-            history["train"].append({"epoch": epoch, **train_metrics})
-            history["val"].append({"epoch": epoch, **val_metrics})
-            history["test"].append({"epoch": epoch, **test_metrics})
-
-            print(
-                f"  Train - Loss: {train_metrics['loss']:.4f} | "
-                f"Acc: {train_metrics['accuracy']:.4f} | F1: {train_metrics['f1']:.4f}"
+        for epoch in range(1, num_epochs + 1):
+            best_val_loss = _run_epoch(
+                epoch, num_epochs, "Full Fine-tune", model, train_loader,
+                val_loader, test_loader, criterion, optimizer, device,
+                num_classes, scheduler, history, best_val_loss, save_dir, model_name,
             )
-            print(
-                f"  Val   - Loss: {val_metrics['loss']:.4f} | "
-                f"Acc: {val_metrics['accuracy']:.4f} | F1: {val_metrics['f1']:.4f}"
-            )
-            print(
-                f"  Test  - Loss: {test_metrics['loss']:.4f} | "
-                f"Acc: {test_metrics['accuracy']:.4f} | F1: {test_metrics['f1']:.4f}"
-            )
+    else:
+        if freeze_epochs > 0:
+            print(f"\n--- Stage 1: Frozen backbone ({freeze_epochs} epochs) ---")
+            freeze_backbone(model, head_name)
+            head = getattr(model, head_name)
+            stage1_optimizer = torch.optim.Adam(head.parameters(), lr=lr)
+            stage1_scheduler = ReduceLROnPlateau(stage1_optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-7)
 
-            if val_metrics["f1"] > best_val_f1:
-                best_val_f1 = val_metrics["f1"]
-                save_path = os.path.join(save_dir, f"{model_name}_best.pth")
-                torch.save(model.state_dict(), save_path)
-                print(f"  -> Best model saved (val F1: {best_val_f1:.4f})")
+            for epoch in range(1, freeze_epochs + 1):
+                best_val_loss = _run_epoch(
+                    epoch, num_epochs, "Stage 1 - Frozen", model, train_loader,
+                    val_loader, test_loader, criterion, stage1_optimizer, device,
+                    num_classes, stage1_scheduler, history, best_val_loss,
+                    save_dir, model_name,
+                )
+
+        stage2_epochs = num_epochs - freeze_epochs
+        if stage2_epochs > 0:
+            print(f"\n--- Stage 2: Fine-tuning all layers ({stage2_epochs} epochs) ---")
+            unfreeze_all(model)
+
+            head = getattr(model, head_name)
+            head_params = set(id(p) for p in head.parameters())
+            backbone_params = [p for p in model.parameters() if id(p) not in head_params]
+            head_params_list = list(head.parameters())
+
+            stage2_optimizer = torch.optim.Adam([
+                {"params": backbone_params, "lr": lr / 10},
+                {"params": head_params_list, "lr": lr},
+            ])
+            scheduler = ReduceLROnPlateau(stage2_optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-7)
+
+            for epoch in range(freeze_epochs + 1, num_epochs + 1):
+                best_val_loss = _run_epoch(
+                    epoch, num_epochs, "Stage 2 - Fine-tune", model, train_loader,
+                    val_loader, test_loader, criterion, stage2_optimizer, device,
+                    num_classes, scheduler, history, best_val_loss, save_dir, model_name,
+                )
 
     final_metrics = {
         "train": history["train"][-1] if history["train"] else {},
         "val": history["val"][-1] if history["val"] else {},
         "test": history["test"][-1] if history["test"] else {},
-        "best_val_f1": best_val_f1,
+        "best_val_loss": best_val_loss,
         "history": history,
     }
 

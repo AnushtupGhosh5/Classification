@@ -22,10 +22,12 @@ from src.models.densenet import create_densenet121
 from src.models.efficientnet import create_efficientnet_b0, create_efficientnet_b1, create_efficientnet_b2
 from src.models.squeezenet import create_squeezenet1_0, create_squeezenet1_1
 from src.models.vgg import create_vgg16
+from src.models.vit import create_vit_b16, create_vit_b32
 from src.models.fusion_mobilenet_densenet import create_fusion_mobilenet_densenet
 from src.losses import FocalLoss
 from src.train import train_model
-from src.evaluate import evaluate_all_splits
+from src.evaluate import evaluate_all_splits, run_test_evaluation
+from src.visualize import plot_training_curves
 
 
 MODEL_REGISTRY = {
@@ -42,10 +44,14 @@ MODEL_REGISTRY = {
     "squeezenet1_0": create_squeezenet1_0,
     "squeezenet1_1": create_squeezenet1_1,
     "vgg16": create_vgg16,
+    "vit_b16": create_vit_b16,
+    "vit_b32": create_vit_b32,
     "mobilenet_densenet_fusion": create_fusion_mobilenet_densenet,
 }
 
 ATTENTION_CHOICES = ["none", "se", "cbam", "eca"]
+
+VIT_MODELS = {"vit_b16", "vit_b32"}
 
 
 def get_data_loaders(data_dir, num_classes, class_names, has_predefined_splits, batch_size, img_size=224, num_workers=4, seed=42):
@@ -151,8 +157,12 @@ def main():
         args.batch_size, args.img_size, args.num_workers, args.seed,
     )
 
+    is_vit = args.model in VIT_MODELS
     print(f"\nModel: {args.model} | Attention: {args.attention} | Loss: {args.loss} | Batch: {args.batch_size} | Epochs: {args.epochs} | LR: {args.lr}")
-    print(f"Freeze epochs: {args.freeze_epochs} | Stage 2 epochs: {args.epochs - args.freeze_epochs}")
+    if is_vit:
+        print(f"ViT model: full fine-tuning from epoch 1 (no freeze stage)")
+    else:
+        print(f"Freeze epochs: {args.freeze_epochs} | Stage 2 epochs: {args.epochs - args.freeze_epochs}")
 
     attention_arg = args.attention if args.attention != "none" else None
     model, head_name = MODEL_REGISTRY[args.model](
@@ -178,7 +188,8 @@ def main():
     attn_suffix = f"_{args.attention}" if args.attention != "none" else ""
     model_label = f"{args.model}{attn_suffix}"
     model_save_dir = os.path.join(args.output_dir, "models", args.dataset, model_label)
-    results_csv = os.path.join(args.output_dir, "results", args.dataset, "results.csv")
+    results_dir = os.path.join(args.output_dir, "results", args.dataset)
+    results_csv = os.path.join(results_dir, "results.csv")
 
     final_metrics = train_model(
         model=model,
@@ -194,7 +205,10 @@ def main():
         freeze_epochs=args.freeze_epochs,
         model_name=model_label,
         save_dir=model_save_dir,
+        skip_freeze=is_vit,
     )
+
+    plot_training_curves(final_metrics["history"], results_dir, model_label)
 
     best_model_path = os.path.join(model_save_dir, f"{model_label}_best.pth")
     if os.path.exists(best_model_path):
@@ -205,6 +219,15 @@ def main():
         model, train_loader, val_loader, test_loader,
         criterion, device, num_classes,
     )
+
+    test_metrics = run_test_evaluation(
+        model, test_loader, class_names, num_classes,
+        device, results_dir, model_label, head_name,
+    )
+
+    for split in ["train", "validation", "test"]:
+        if split in final_results:
+            final_results[split]["macro_auc"] = test_metrics.get("macro_auc", 0.0)
 
     save_results_csv(
         final_results, results_csv,
