@@ -77,8 +77,8 @@ def _run_epoch(epoch, num_epochs, stage_label, model, train_loader, val_loader,
     print(f"\nEpoch {epoch}/{num_epochs} [{stage_label}]")
 
     train_metrics = train_one_epoch(model, train_loader, criterion, optimizer, device, num_classes)
-    val_metrics = evaluate_model(model, val_loader, criterion, device, num_classes)
-    test_metrics = evaluate_model(model, test_loader, criterion, device, num_classes)
+    val_metrics, _ = evaluate_model(model, val_loader, criterion, device, num_classes)
+    test_metrics, _ = evaluate_model(model, test_loader, criterion, device, num_classes)
 
     scheduler.step(val_metrics["loss"])
 
