@@ -14,9 +14,12 @@ from src.data.dataset_config import get_dataset_config
 from src.data.dataset import FolderDataset, create_splits
 from src.data.preprocess import get_train_transforms, get_val_transforms
 from src.models.mobilenetv2 import create_mobilenetv2
+from src.models.mobilenetv3 import create_mobilenetv3_small, create_mobilenetv3_large
+from src.models.resnet34 import create_resnet34
 from src.models.resnet50 import create_resnet50
+from src.models.resnet101 import create_resnet101
 from src.models.densenet import create_densenet121
-from src.models.efficientnet import create_efficientnet_b0
+from src.models.efficientnet import create_efficientnet_b0, create_efficientnet_b1, create_efficientnet_b2
 from src.models.fusion_mobilenet_densenet import create_fusion_mobilenet_densenet
 from src.losses import FocalLoss
 from src.train import train_model
@@ -25,9 +28,15 @@ from src.evaluate import evaluate_all_splits
 
 MODEL_REGISTRY = {
     "mobilenetv2": create_mobilenetv2,
+    "mobilenetv3_small": create_mobilenetv3_small,
+    "mobilenetv3_large": create_mobilenetv3_large,
+    "resnet34": create_resnet34,
     "resnet50": create_resnet50,
+    "resnet101": create_resnet101,
     "densenet121": create_densenet121,
     "efficientnet_b0": create_efficientnet_b0,
+    "efficientnet_b1": create_efficientnet_b1,
+    "efficientnet_b2": create_efficientnet_b2,
     "mobilenet_densenet_fusion": create_fusion_mobilenet_densenet,
 }
 

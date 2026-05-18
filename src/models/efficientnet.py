@@ -6,7 +6,7 @@ import torchvision.models as models
 from src.models.attention import get_attention_module
 
 
-class EfficientNetB0WithAttention(nn.Module):
+class EfficientNetWithAttention(nn.Module):
     def __init__(self, backbone, attention_module, in_features, num_classes):
         super().__init__()
         self.features = backbone.features
@@ -26,14 +26,34 @@ class EfficientNetB0WithAttention(nn.Module):
         return x
 
 
-def create_efficientnet_b0(num_classes=2, pretrained=True, attention=None):
-    backbone = models.efficientnet_b0(
-        weights=models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
-    )
+def _create_efficientnet(weight_cls, model_fn, num_classes, pretrained, attention):
+    backbone = model_fn(weights=weight_cls.DEFAULT if pretrained else None)
     in_features = backbone.classifier[1].in_features
     if attention and attention != "none":
-        attn_module = get_attention_module(attention, in_features)
-        model = EfficientNetB0WithAttention(backbone, attn_module, in_features, num_classes)
+        last_channel = backbone.features[-1].out_channels
+        attn_module = get_attention_module(attention, last_channel)
+        model = EfficientNetWithAttention(backbone, attn_module, in_features, num_classes)
         return model, "classifier"
     backbone.classifier[1] = nn.Linear(in_features, num_classes)
     return backbone, "classifier"
+
+
+def create_efficientnet_b0(num_classes=2, pretrained=True, attention=None):
+    return _create_efficientnet(
+        models.EfficientNet_B0_Weights, models.efficientnet_b0,
+        num_classes, pretrained, attention,
+    )
+
+
+def create_efficientnet_b1(num_classes=2, pretrained=True, attention=None):
+    return _create_efficientnet(
+        models.EfficientNet_B1_Weights, models.efficientnet_b1,
+        num_classes, pretrained, attention,
+    )
+
+
+def create_efficientnet_b2(num_classes=2, pretrained=True, attention=None):
+    return _create_efficientnet(
+        models.EfficientNet_B2_Weights, models.efficientnet_b2,
+        num_classes, pretrained, attention,
+    )
