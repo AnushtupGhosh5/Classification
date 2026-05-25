@@ -24,6 +24,8 @@ from src.models.squeezenet import create_squeezenet1_0, create_squeezenet1_1
 from src.models.vgg import create_vgg16
 from src.models.vit import create_vit_b16, create_vit_b32
 from src.models.fusion_mobilenet_densenet import create_fusion_mobilenet_densenet
+from src.models.dual_fusion import create_dual_fusion
+from src.models.backbone_extractor import BACKBONE_CHOICES
 from src.losses import FocalLoss
 from src.train import train_model
 from src.evaluate import evaluate_all_splits, run_test_evaluation
@@ -80,6 +82,12 @@ def get_data_loaders(data_dir, num_classes, class_names, has_predefined_splits, 
     return train_loader, val_loader, test_loader
 
 
+CSV_FIELDS = [
+    "model", "dataset", "attention", "batch_size", "epochs", "lr", "split",
+    "accuracy", "precision", "recall", "f1", "specificity", "loss", "macro_auc",
+]
+
+
 def save_results_csv(results, filepath, model_name, dataset_name, attention, batch_size, epochs, lr):
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
@@ -100,7 +108,7 @@ def save_results_csv(results, filepath, model_name, dataset_name, attention, bat
 
     file_exists = os.path.exists(filepath)
     with open(filepath, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
         if not file_exists:
             writer.writeheader()
         writer.writerows(rows)
@@ -120,11 +128,20 @@ def main():
                         choices=["all4", "lymphoma", "pbc8", "raabin"],
                         help="Dataset to use")
     parser.add_argument("--model", type=str, required=True,
-                        choices=list(MODEL_REGISTRY.keys()),
+                        choices=list(MODEL_REGISTRY.keys()) + ["dual_fusion"],
                         help="Model architecture")
     parser.add_argument("--attention", type=str, default="none",
                         choices=ATTENTION_CHOICES,
                         help="Attention mechanism: none, se (SEBlock), cbam, eca")
+    parser.add_argument("--backbone1", type=str, default="mobilenetv2",
+                        choices=BACKBONE_CHOICES,
+                        help="First backbone for dual_fusion model")
+    parser.add_argument("--backbone2", type=str, default="densenet121",
+                        choices=BACKBONE_CHOICES,
+                        help="Second backbone for dual_fusion model")
+    parser.add_argument("--fusion-mode", type=str, default="both",
+                        choices=["pre_fusion", "post_fusion", "both"],
+                        help="Where to apply attention in dual_fusion: pre_fusion, post_fusion, or both")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -158,16 +175,27 @@ def main():
     )
 
     is_vit = args.model in VIT_MODELS
+    is_dual_fusion = args.model == "dual_fusion"
     print(f"\nModel: {args.model} | Attention: {args.attention} | Loss: {args.loss} | Batch: {args.batch_size} | Epochs: {args.epochs} | LR: {args.lr}")
-    if is_vit:
+    if is_dual_fusion:
+        print(f"Backbones: {args.backbone1} + {args.backbone2} | Fusion mode: {args.fusion_mode}")
+        print(f"Freeze epochs: {args.freeze_epochs} | Stage 2 epochs: {args.epochs - args.freeze_epochs}")
+    elif is_vit:
         print(f"ViT model: full fine-tuning from epoch 1 (no freeze stage)")
     else:
         print(f"Freeze epochs: {args.freeze_epochs} | Stage 2 epochs: {args.epochs - args.freeze_epochs}")
 
     attention_arg = args.attention if args.attention != "none" else None
-    model, head_name = MODEL_REGISTRY[args.model](
-        num_classes=num_classes, pretrained=True, attention=attention_arg,
-    )
+    if is_dual_fusion:
+        model, head_name = create_dual_fusion(
+            num_classes=num_classes, pretrained=True, attention=attention_arg,
+            backbone1=args.backbone1, backbone2=args.backbone2,
+            fusion_mode=args.fusion_mode,
+        )
+    else:
+        model, head_name = MODEL_REGISTRY[args.model](
+            num_classes=num_classes, pretrained=True, attention=attention_arg,
+        )
     model = model.to(device)
 
     class_counts = train_loader.dataset.get_class_counts()
@@ -186,7 +214,10 @@ def main():
     print(f"Class weights: {class_weights.cpu().tolist()} ({counts_str})")
 
     attn_suffix = f"_{args.attention}" if args.attention != "none" else ""
-    model_label = f"{args.model}{attn_suffix}"
+    if is_dual_fusion:
+        model_label = f"dual_fusion_{args.backbone1}_{args.backbone2}{attn_suffix}_{args.fusion_mode}"
+    else:
+        model_label = f"{args.model}{attn_suffix}"
     model_save_dir = os.path.join(args.output_dir, "models", args.dataset, model_label)
     results_dir = os.path.join(args.output_dir, "results", args.dataset)
     results_csv = os.path.join(results_dir, "results.csv")
@@ -231,7 +262,8 @@ def main():
 
     save_results_csv(
         final_results, results_csv,
-        args.model, args.dataset, args.attention,
+        model_label if is_dual_fusion else args.model,
+        args.dataset, args.attention,
         args.batch_size, args.epochs, args.lr,
     )
 

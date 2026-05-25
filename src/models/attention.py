@@ -92,6 +92,21 @@ ATTENTION_REGISTRY = {
 }
 
 
+class SE1DBlock(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        mid = max(channels // reduction, 8)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, mid, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        return x * self.fc(x)
+
+
 def get_attention_module(name, channels):
     if name is None or name == "none":
         return nn.Identity()
