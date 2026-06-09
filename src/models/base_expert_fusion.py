@@ -2,27 +2,45 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.expert_branches import SemanticExpert, FrequencyExpert, GeometryExpert
+from src.models.expert_branches import (
+    SemanticExpert,
+    FrequencyExpert,
+    GeometryExpert,
+    MultiLayerExpert,
+)
 
 
 class BaseExpertFusion(nn.Module):
     def __init__(
         self,
-        semantic_expert,
-        frequency_expert,
-        geometry_expert,
-        proj_dim,
-        num_classes,
+        semantic_expert=None,
+        frequency_expert=None,
+        geometry_expert=None,
+        proj_dim=256,
+        num_classes=2,
+        expert_mode="multi_backbone",
+        multi_layer_expert=None,
     ):
         super().__init__()
-        self.semantic_expert = semantic_expert
-        self.frequency_expert = frequency_expert
-        self.geometry_expert = geometry_expert
+        self.expert_mode = expert_mode
         self.proj_dim = proj_dim
 
-        self.proj_s = nn.Conv2d(semantic_expert.feature_dim, proj_dim, 1)
-        self.proj_f = nn.Conv2d(frequency_expert.feature_dim, proj_dim, 1)
-        self.proj_g = nn.Conv2d(geometry_expert.feature_dim, proj_dim, 1)
+        if expert_mode == "multi_backbone":
+            self.semantic_expert = semantic_expert
+            self.frequency_expert = frequency_expert
+            self.geometry_expert = geometry_expert
+
+            self.proj_s = nn.Conv2d(semantic_expert.feature_dim, proj_dim, 1)
+            self.proj_f = nn.Conv2d(frequency_expert.feature_dim, proj_dim, 1)
+            self.proj_g = nn.Conv2d(geometry_expert.feature_dim, proj_dim, 1)
+
+        elif expert_mode == "multi_layer":
+            self.multi_layer_expert = multi_layer_expert
+            channels = multi_layer_expert.channels
+
+            self.proj_s = nn.Conv2d(channels[0], proj_dim, 1)
+            self.proj_f = nn.Conv2d(channels[1], proj_dim, 1)
+            self.proj_g = nn.Conv2d(channels[2], proj_dim, 1)
 
         self.head = nn.Sequential(
             nn.BatchNorm1d(proj_dim),
@@ -54,20 +72,23 @@ class BaseExpertFusion(nn.Module):
         return aligned
 
     def extract_expert_features(self, x):
-        fs = self.semantic_expert(x)
-        ff = self.frequency_expert(x)
-        fg = self.geometry_expert(x)
+        if self.expert_mode == "multi_layer":
+            f1, f2, f3 = self.multi_layer_expert(x)
+        else:
+            f1 = self.semantic_expert(x)
+            f2 = self.frequency_expert(x)
+            f3 = self.geometry_expert(x)
 
-        fs = self._to_4d(fs, self.semantic_expert)
-        ff = self._to_4d(ff, self.frequency_expert)
-        fg = self._to_4d(fg, self.geometry_expert)
+            f1 = self._to_4d(f1, self.semantic_expert)
+            f2 = self._to_4d(f2, self.frequency_expert)
+            f3 = self._to_4d(f3, self.geometry_expert)
 
-        fs = self.proj_s(fs)
-        ff = self.proj_f(ff)
-        fg = self.proj_g(fg)
+        f1 = self.proj_s(f1)
+        f2 = self.proj_f(f2)
+        f3 = self.proj_g(f3)
 
-        fs, ff, fg = self._align_features([fs, ff, fg])
-        return fs, ff, fg
+        f1, f2, f3 = self._align_features([f1, f2, f3])
+        return f1, f2, f3
 
     def pool_and_classify(self, fused):
         pooled = F.adaptive_avg_pool2d(fused, (1, 1))

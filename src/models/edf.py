@@ -2,22 +2,35 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.expert_branches import SemanticExpert, FrequencyExpert, GeometryExpert
+from src.models.expert_branches import (
+    SemanticExpert,
+    FrequencyExpert,
+    GeometryExpert,
+    MultiLayerExpert,
+)
 from src.models.base_expert_fusion import BaseExpertFusion
 
 
 class ExpertDisagreementFusion(BaseExpertFusion):
     def __init__(
         self,
-        semantic_expert,
-        frequency_expert,
-        geometry_expert,
-        proj_dim,
-        num_classes,
+        semantic_expert=None,
+        frequency_expert=None,
+        geometry_expert=None,
+        proj_dim=256,
+        num_classes=2,
         disagreement_type="abs",
+        expert_mode="multi_backbone",
+        multi_layer_expert=None,
     ):
         super().__init__(
-            semantic_expert, frequency_expert, geometry_expert, proj_dim, num_classes
+            semantic_expert=semantic_expert,
+            frequency_expert=frequency_expert,
+            geometry_expert=geometry_expert,
+            proj_dim=proj_dim,
+            num_classes=num_classes,
+            expert_mode=expert_mode,
+            multi_layer_expert=multi_layer_expert,
         )
         self.disagreement_type = disagreement_type
 
@@ -87,11 +100,28 @@ def create_edf(
     backbone3="densenet121",
     proj_dim=256,
     disagreement_type="abs",
+    expert_mode="multi_backbone",
 ):
-    semantic = SemanticExpert(backbone1, pretrained)
-    frequency = FrequencyExpert(backbone2, pretrained)
-    geometry = GeometryExpert(backbone3, pretrained)
-    model = ExpertDisagreementFusion(
-        semantic, frequency, geometry, proj_dim, num_classes, disagreement_type
-    )
+    if expert_mode == "multi_layer":
+        ml_expert = MultiLayerExpert(backbone1, pretrained)
+        model = ExpertDisagreementFusion(
+            proj_dim=proj_dim,
+            num_classes=num_classes,
+            disagreement_type=disagreement_type,
+            expert_mode="multi_layer",
+            multi_layer_expert=ml_expert,
+        )
+    else:
+        semantic = SemanticExpert(backbone1, pretrained)
+        frequency = FrequencyExpert(backbone2, pretrained)
+        geometry = GeometryExpert(backbone3, pretrained)
+        model = ExpertDisagreementFusion(
+            semantic_expert=semantic,
+            frequency_expert=frequency_expert,
+            geometry_expert=geometry,
+            proj_dim=proj_dim,
+            num_classes=num_classes,
+            disagreement_type=disagreement_type,
+            expert_mode="multi_backbone",
+        )
     return model, "head"

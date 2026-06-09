@@ -2,23 +2,36 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.expert_branches import SemanticExpert, FrequencyExpert, GeometryExpert
+from src.models.expert_branches import (
+    SemanticExpert,
+    FrequencyExpert,
+    GeometryExpert,
+    MultiLayerExpert,
+)
 from src.models.base_expert_fusion import BaseExpertFusion
 
 
 class ConfidenceAwareExpertFusion(BaseExpertFusion):
     def __init__(
         self,
-        semantic_expert,
-        frequency_expert,
-        geometry_expert,
-        proj_dim,
-        num_classes,
+        semantic_expert=None,
+        frequency_expert=None,
+        geometry_expert=None,
+        proj_dim=256,
+        num_classes=2,
         confidence_type="scalar",
         fuzzy_lambda=0.1,
+        expert_mode="multi_backbone",
+        multi_layer_expert=None,
     ):
         super().__init__(
-            semantic_expert, frequency_expert, geometry_expert, proj_dim, num_classes
+            semantic_expert=semantic_expert,
+            frequency_expert=frequency_expert,
+            geometry_expert=geometry_expert,
+            proj_dim=proj_dim,
+            num_classes=num_classes,
+            expert_mode=expert_mode,
+            multi_layer_expert=multi_layer_expert,
         )
         self.confidence_type = confidence_type
         self.fuzzy_lambda = fuzzy_lambda
@@ -166,11 +179,28 @@ def create_caef(
     backbone3="densenet121",
     proj_dim=256,
     confidence_type="scalar",
+    expert_mode="multi_backbone",
 ):
-    semantic = SemanticExpert(backbone1, pretrained)
-    frequency = FrequencyExpert(backbone2, pretrained)
-    geometry = GeometryExpert(backbone3, pretrained)
-    model = ConfidenceAwareExpertFusion(
-        semantic, frequency, geometry, proj_dim, num_classes, confidence_type
-    )
+    if expert_mode == "multi_layer":
+        ml_expert = MultiLayerExpert(backbone1, pretrained)
+        model = ConfidenceAwareExpertFusion(
+            proj_dim=proj_dim,
+            num_classes=num_classes,
+            confidence_type=confidence_type,
+            expert_mode="multi_layer",
+            multi_layer_expert=ml_expert,
+        )
+    else:
+        semantic = SemanticExpert(backbone1, pretrained)
+        frequency = FrequencyExpert(backbone2, pretrained)
+        geometry = GeometryExpert(backbone3, pretrained)
+        model = ConfidenceAwareExpertFusion(
+            semantic_expert=semantic,
+            frequency_expert=frequency_expert,
+            geometry_expert=geometry,
+            proj_dim=proj_dim,
+            num_classes=num_classes,
+            confidence_type=confidence_type,
+            expert_mode="multi_backbone",
+        )
     return model, "head"

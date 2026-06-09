@@ -163,6 +163,9 @@ def main():
                         help="Confidence estimation type in CAEF")
     parser.add_argument("--proj-dim", type=int, default=256,
                         help="Common projection dimension for expert features")
+    parser.add_argument("--expert-mode", type=str, default="multi_backbone",
+                        choices=["multi_backbone", "multi_layer"],
+                        help="Expert mode: multi_backbone (3 separate backbones) or multi_layer (1 backbone, 3 layers)")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -200,7 +203,10 @@ def main():
     is_expert_fusion = args.model in ("cef", "edf", "caef", "mief")
     print(f"\nModel: {args.model} | Attention: {args.attention} | Loss: {args.loss} | Batch: {args.batch_size} | Epochs: {args.epochs} | LR: {args.lr}")
     if is_expert_fusion:
-        print(f"Experts: {args.backbone1}(semantic) + {args.backbone2}(frequency) + {args.backbone3}(geometry)")
+        if args.expert_mode == "multi_layer":
+            print(f"Expert mode: multi_layer | Backbone: {args.backbone1}")
+        else:
+            print(f"Expert mode: multi_backbone | {args.backbone1}(semantic) + {args.backbone2}(frequency) + {args.backbone3}(geometry)")
         if args.model == "cef":
             print(f"Top-K: {args.top_k}")
         elif args.model == "edf":
@@ -227,6 +233,7 @@ def main():
             backbone2=args.backbone2,
             backbone3=args.backbone3,
             proj_dim=args.proj_dim,
+            expert_mode=args.expert_mode,
         )
         if args.model == "cef":
             expert_kwargs["top_k"] = args.top_k
@@ -264,7 +271,10 @@ def main():
 
     attn_suffix = f"_{args.attention}" if args.attention != "none" else ""
     if is_expert_fusion:
-        parts = [args.model, args.backbone1, args.backbone2, args.backbone3]
+        if args.expert_mode == "multi_layer":
+            parts = [args.model, "ml", args.backbone1]
+        else:
+            parts = [args.model, args.backbone1, args.backbone2, args.backbone3]
         if args.model == "cef":
             parts.append(f"top{args.top_k}")
         elif args.model == "edf":
