@@ -56,8 +56,13 @@ def evaluate_model(model, dataloader, criterion, device, num_classes):
         images = images.to(device)
         labels = labels.to(device)
 
-        outputs = model(images)
-        loss = criterion(outputs, labels)
+        result = model(images)
+        if isinstance(result, dict):
+            outputs = result["logits"]
+            loss = criterion(outputs, labels) + result.get("aux_loss", 0.0)
+        else:
+            outputs = result
+            loss = criterion(outputs, labels)
 
         total_loss += loss.item() * images.size(0)
         total_samples += images.size(0)

@@ -33,8 +33,13 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes
         labels = labels.to(device)
 
         optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
+        result = model(images)
+        if isinstance(result, dict):
+            outputs = result["logits"]
+            loss = criterion(outputs, labels) + result.get("aux_loss", 0.0)
+        else:
+            outputs = result
+            loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
 

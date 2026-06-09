@@ -26,6 +26,10 @@ from src.models.vit import create_vit_b16, create_vit_b32
 from src.models.fusion_mobilenet_densenet import create_fusion_mobilenet_densenet
 from src.models.dual_fusion import create_dual_fusion
 from src.models.backbone_extractor import BACKBONE_CHOICES
+from src.models.cef import create_cef
+from src.models.edf import create_edf
+from src.models.caef import create_caef
+from src.models.mief import create_mief
 from src.losses import FocalLoss
 from src.train import train_model
 from src.evaluate import evaluate_all_splits, run_test_evaluation
@@ -49,6 +53,10 @@ MODEL_REGISTRY = {
     "vit_b16": create_vit_b16,
     "vit_b32": create_vit_b32,
     "mobilenet_densenet_fusion": create_fusion_mobilenet_densenet,
+    "cef": create_cef,
+    "edf": create_edf,
+    "caef": create_caef,
+    "mief": create_mief,
 }
 
 ATTENTION_CHOICES = ["none", "se", "cbam", "eca"]
@@ -125,7 +133,7 @@ def save_history_json(history, filepath):
 def main():
     parser = argparse.ArgumentParser(description="Image Classification Pipeline")
     parser.add_argument("--dataset", type=str, required=True,
-                        choices=["all4", "lymphoma", "pbc8", "raabin"],
+                        choices=["all4", "lymphoma", "pbc8", "raabin", "milk10k"],
                         help="Dataset to use")
     parser.add_argument("--model", type=str, required=True,
                         choices=list(MODEL_REGISTRY.keys()) + ["dual_fusion"],
@@ -133,15 +141,28 @@ def main():
     parser.add_argument("--attention", type=str, default="none",
                         choices=ATTENTION_CHOICES,
                         help="Attention mechanism: none, se (SEBlock), cbam, eca")
-    parser.add_argument("--backbone1", type=str, default="mobilenetv2",
+    parser.add_argument("--backbone1", type=str, default="resnet50",
                         choices=BACKBONE_CHOICES,
-                        help="First backbone for dual_fusion model")
-    parser.add_argument("--backbone2", type=str, default="densenet121",
+                        help="Semantic expert backbone (expert fusion models)")
+    parser.add_argument("--backbone2", type=str, default="mobilenetv2",
                         choices=BACKBONE_CHOICES,
-                        help="Second backbone for dual_fusion model")
+                        help="Frequency expert backbone (expert fusion models)")
+    parser.add_argument("--backbone3", type=str, default="densenet121",
+                        choices=BACKBONE_CHOICES,
+                        help="Geometry expert backbone (expert fusion models)")
     parser.add_argument("--fusion-mode", type=str, default="both",
                         choices=["pre_fusion", "post_fusion", "both"],
-                        help="Where to apply attention in dual_fusion: pre_fusion, post_fusion, or both")
+                        help="Where to apply attention in dual_fusion")
+    parser.add_argument("--top-k", type=int, default=2,
+                        help="Number of experts to select in CEF")
+    parser.add_argument("--disagreement-type", type=str, default="abs",
+                        choices=["abs", "cosine", "learnable"],
+                        help="Disagreement computation type in EDF")
+    parser.add_argument("--confidence-type", type=str, default="scalar",
+                        choices=["scalar", "channel", "uncertainty", "fuzzy"],
+                        help="Confidence estimation type in CAEF")
+    parser.add_argument("--proj-dim", type=int, default=256,
+                        help="Common projection dimension for expert features")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -176,8 +197,19 @@ def main():
 
     is_vit = args.model in VIT_MODELS
     is_dual_fusion = args.model == "dual_fusion"
+    is_expert_fusion = args.model in ("cef", "edf", "caef", "mief")
     print(f"\nModel: {args.model} | Attention: {args.attention} | Loss: {args.loss} | Batch: {args.batch_size} | Epochs: {args.epochs} | LR: {args.lr}")
-    if is_dual_fusion:
+    if is_expert_fusion:
+        print(f"Experts: {args.backbone1}(semantic) + {args.backbone2}(frequency) + {args.backbone3}(geometry)")
+        if args.model == "cef":
+            print(f"Top-K: {args.top_k}")
+        elif args.model == "edf":
+            print(f"Disagreement type: {args.disagreement_type}")
+        elif args.model == "caef":
+            print(f"Confidence type: {args.confidence_type}")
+        print(f"Projection dim: {args.proj_dim}")
+        print(f"Freeze epochs: {args.freeze_epochs} | Stage 2 epochs: {args.epochs - args.freeze_epochs}")
+    elif is_dual_fusion:
         print(f"Backbones: {args.backbone1} + {args.backbone2} | Fusion mode: {args.fusion_mode}")
         print(f"Freeze epochs: {args.freeze_epochs} | Stage 2 epochs: {args.epochs - args.freeze_epochs}")
     elif is_vit:
@@ -186,7 +218,24 @@ def main():
         print(f"Freeze epochs: {args.freeze_epochs} | Stage 2 epochs: {args.epochs - args.freeze_epochs}")
 
     attention_arg = args.attention if args.attention != "none" else None
-    if is_dual_fusion:
+    if is_expert_fusion:
+        expert_kwargs = dict(
+            num_classes=num_classes,
+            pretrained=True,
+            attention=attention_arg,
+            backbone1=args.backbone1,
+            backbone2=args.backbone2,
+            backbone3=args.backbone3,
+            proj_dim=args.proj_dim,
+        )
+        if args.model == "cef":
+            expert_kwargs["top_k"] = args.top_k
+        elif args.model == "edf":
+            expert_kwargs["disagreement_type"] = args.disagreement_type
+        elif args.model == "caef":
+            expert_kwargs["confidence_type"] = args.confidence_type
+        model, head_name = MODEL_REGISTRY[args.model](**expert_kwargs)
+    elif is_dual_fusion:
         model, head_name = create_dual_fusion(
             num_classes=num_classes, pretrained=True, attention=attention_arg,
             backbone1=args.backbone1, backbone2=args.backbone2,
@@ -214,7 +263,16 @@ def main():
     print(f"Class weights: {class_weights.cpu().tolist()} ({counts_str})")
 
     attn_suffix = f"_{args.attention}" if args.attention != "none" else ""
-    if is_dual_fusion:
+    if is_expert_fusion:
+        parts = [args.model, args.backbone1, args.backbone2, args.backbone3]
+        if args.model == "cef":
+            parts.append(f"top{args.top_k}")
+        elif args.model == "edf":
+            parts.append(args.disagreement_type)
+        elif args.model == "caef":
+            parts.append(args.confidence_type)
+        model_label = "_".join(parts)
+    elif is_dual_fusion:
         model_label = f"dual_fusion_{args.backbone1}_{args.backbone2}{attn_suffix}_{args.fusion_mode}"
     else:
         model_label = f"{args.model}{attn_suffix}"

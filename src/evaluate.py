@@ -43,7 +43,11 @@ def run_test_evaluation(model, test_loader, class_names, num_classes, device,
     with torch.no_grad():
         for images, labels in test_loader:
             images = images.to(device)
-            outputs = model(images)
+            result = model(images)
+            if isinstance(result, dict):
+                outputs = result["logits"]
+            else:
+                outputs = result
             preds = outputs.argmax(dim=1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.numpy())

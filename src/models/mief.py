@@ -1,0 +1,86 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from src.models.expert_branches import SemanticExpert, FrequencyExpert, GeometryExpert
+from src.models.base_expert_fusion import BaseExpertFusion
+
+
+class MutualInfoExpertFusion(BaseExpertFusion):
+    def __init__(
+        self,
+        semantic_expert,
+        frequency_expert,
+        geometry_expert,
+        proj_dim,
+        num_classes,
+        mi_dim=128,
+    ):
+        super().__init__(
+            semantic_expert, frequency_expert, geometry_expert, proj_dim, num_classes
+        )
+        self.mi_dim = mi_dim
+
+        self.phi_s = nn.Sequential(
+            nn.Conv2d(proj_dim, mi_dim, 1, bias=False),
+            nn.ReLU(inplace=True),
+        )
+        self.phi_f = nn.Sequential(
+            nn.Conv2d(proj_dim, mi_dim, 1, bias=False),
+            nn.ReLU(inplace=True),
+        )
+        self.phi_g = nn.Sequential(
+            nn.Conv2d(proj_dim, mi_dim, 1, bias=False),
+            nn.ReLU(inplace=True),
+        )
+
+        self.mi_estimator = nn.Sequential(
+            nn.Linear(mi_dim * 2, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 1),
+        )
+
+        self.weight_gen = nn.Sequential(
+            nn.Linear(3, 16),
+            nn.ReLU(inplace=True),
+            nn.Linear(16, 3),
+        )
+
+    def forward(self, x):
+        fs, ff, fg = self.extract_expert_features(x)
+
+        zs = F.adaptive_avg_pool2d(self.phi_s(fs), (1, 1)).flatten(1)
+        zf = F.adaptive_avg_pool2d(self.phi_f(ff), (1, 1)).flatten(1)
+        zg = F.adaptive_avg_pool2d(self.phi_g(fg), (1, 1)).flatten(1)
+
+        mi_sf = self.mi_estimator(torch.cat([zs, zf], dim=-1)).squeeze(-1)
+        mi_sg = self.mi_estimator(torch.cat([zs, zg], dim=-1)).squeeze(-1)
+        mi_fg = self.mi_estimator(torch.cat([zf, zg], dim=-1)).squeeze(-1)
+
+        c_matrix = torch.stack([1 - mi_sf, 1 - mi_sg, 1 - mi_fg], dim=-1)
+        weights = F.softmax(self.weight_gen(c_matrix), dim=-1)
+
+        ws = weights[:, 0].unsqueeze(1).unsqueeze(2).unsqueeze(3)
+        wf = weights[:, 1].unsqueeze(1).unsqueeze(2).unsqueeze(3)
+        wg = weights[:, 2].unsqueeze(1).unsqueeze(2).unsqueeze(3)
+        fused = ws * fs + wf * ff + wg * fg
+
+        return self.pool_and_classify(fused)
+
+
+def create_mief(
+    num_classes=2,
+    pretrained=True,
+    attention=None,
+    backbone1="resnet50",
+    backbone2="mobilenetv2",
+    backbone3="densenet121",
+    proj_dim=256,
+):
+    semantic = SemanticExpert(backbone1, pretrained)
+    frequency = FrequencyExpert(backbone2, pretrained)
+    geometry = GeometryExpert(backbone3, pretrained)
+    model = MutualInfoExpertFusion(
+        semantic, frequency, geometry, proj_dim, num_classes
+    )
+    return model, "head"
