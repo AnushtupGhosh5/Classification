@@ -36,6 +36,13 @@ class FrequencyExpert(nn.Module):
         self.feature_dim = self.extractor.feature_dim
         self.is_2d = self.extractor.is_2d
         reset_batchnorm(self.extractor)
+        self.adapter = nn.Sequential(
+            nn.Conv2d(3, 16, 3, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 3, 3, padding=1, bias=False),
+            nn.BatchNorm2d(3),
+        )
 
     def preprocess(self, x):
         x_complex = torch.fft.fft2(x, norm="ortho")
@@ -50,7 +57,8 @@ class FrequencyExpert(nn.Module):
 
     def forward(self, x):
         x_freq = self.preprocess(x)
-        return self.extractor(x_freq)
+        x_adapted = self.adapter(x_freq)
+        return self.extractor(x_adapted)
 
 
 class GeometryExpert(nn.Module):
@@ -60,6 +68,13 @@ class GeometryExpert(nn.Module):
         self.feature_dim = self.extractor.feature_dim
         self.is_2d = self.extractor.is_2d
         reset_batchnorm(self.extractor)
+        self.adapter = nn.Sequential(
+            nn.Conv2d(3, 16, 3, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 3, 3, padding=1, bias=False),
+            nn.BatchNorm2d(3),
+        )
 
         sobel_x = torch.tensor(
             [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32
@@ -89,7 +104,8 @@ class GeometryExpert(nn.Module):
 
     def forward(self, x):
         x_geo = self.preprocess(x)
-        return self.extractor(x_geo)
+        x_adapted = self.adapter(x_geo)
+        return self.extractor(x_adapted)
 
 
 MULTI_LAYER_EXCLUDED = {"vit_b16", "vit_b32"}
