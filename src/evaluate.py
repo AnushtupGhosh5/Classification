@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from src.utils import evaluate_model, extract_features
 from src.visualize import plot_confusion_matrix, plot_roc_auc, plot_tsne
+from src.gradcam import visualize_gradcam, visualize_gradcam_per_expert
 
 
 def evaluate_all_splits(model, train_loader, val_loader, test_loader, criterion, device, num_classes):
@@ -32,7 +33,8 @@ def evaluate_all_splits(model, train_loader, val_loader, test_loader, criterion,
 
 
 def run_test_evaluation(model, test_loader, class_names, num_classes, device,
-                        save_dir, model_label, head_name="classifier"):
+                        save_dir, model_label, head_name="classifier",
+                        model_name=None, is_expert_fusion=False):
     os.makedirs(save_dir, exist_ok=True)
 
     all_preds = []
@@ -77,6 +79,16 @@ def run_test_evaluation(model, test_loader, class_names, num_classes, device,
 
     features, feat_labels = extract_features(model, test_loader, device, head_name)
     plot_tsne(features, feat_labels, class_names, save_dir, model_label)
+
+    if is_expert_fusion:
+        visualize_gradcam_per_expert(
+            model, test_loader, device, save_dir, model_label, num_images=4,
+        )
+    else:
+        visualize_gradcam(
+            model, test_loader, device, save_dir, model_label,
+            num_images=8, model_name=model_name,
+        )
 
     metrics["macro_auc"] = round(macro_auc, 4)
     return metrics

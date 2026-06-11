@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.expert_branches import SemanticExpert, MultiLayerExpert
+from src.models.expert_branches import SemanticExpert, FrequencyExpert, GeometryExpert, MultiLayerExpert
 from src.models.base_expert_fusion import BaseExpertFusion
 
 
@@ -79,8 +79,8 @@ def create_cef(
         )
     else:
         expert1 = SemanticExpert(backbone1, pretrained)
-        expert2 = SemanticExpert(backbone2, pretrained)
-        expert3 = SemanticExpert(backbone3, pretrained)
+        expert2 = FrequencyExpert(backbone2, pretrained)
+        expert3 = GeometryExpert(backbone3, pretrained)
         model = CompetitiveExpertFusion(
             expert1=expert1,
             expert2=expert2,

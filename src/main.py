@@ -206,7 +206,7 @@ def main():
         if args.expert_mode == "multi_layer":
             print(f"Expert mode: multi_layer | Backbone: {args.backbone1}")
         else:
-            print(f"Expert mode: multi_backbone | {args.backbone1} + {args.backbone2} + {args.backbone3}")
+            print(f"Expert mode: multi_backbone | {args.backbone1}(semantic) + {args.backbone2}(frequency) + {args.backbone3}(geometry)")
         if args.model == "cef":
             print(f"Top-K: {args.top_k}")
         elif args.model == "edf":
@@ -322,6 +322,7 @@ def main():
     test_metrics = run_test_evaluation(
         model, test_loader, class_names, num_classes,
         device, results_dir, model_label, head_name,
+        model_name=args.model, is_expert_fusion=is_expert_fusion,
     )
 
     for split in ["train", "validation", "test"]:

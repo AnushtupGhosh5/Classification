@@ -5,6 +5,19 @@ import torch.nn.functional as F
 from src.models.backbone_extractor import create_backbone, BACKBONE_CHOICES
 
 
+def reset_batchnorm(module):
+    with torch.no_grad():
+        for m in module.modules():
+            if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
+                m.running_mean.zero_()
+                m.running_var.fill_(1.0)
+                if m.weight is not None:
+                    m.weight.fill_(1.0)
+                if m.bias is not None:
+                    m.bias.zero_()
+                m.num_batches_tracked.zero_()
+
+
 class SemanticExpert(nn.Module):
     def __init__(self, backbone_name, pretrained=True):
         super().__init__()
@@ -22,6 +35,7 @@ class FrequencyExpert(nn.Module):
         self.extractor = create_backbone(backbone_name, pretrained)
         self.feature_dim = self.extractor.feature_dim
         self.is_2d = self.extractor.is_2d
+        reset_batchnorm(self.extractor)
 
     def preprocess(self, x):
         x_complex = torch.fft.fft2(x, norm="ortho")
@@ -45,6 +59,7 @@ class GeometryExpert(nn.Module):
         self.extractor = create_backbone(backbone_name, pretrained)
         self.feature_dim = self.extractor.feature_dim
         self.is_2d = self.extractor.is_2d
+        reset_batchnorm(self.extractor)
 
         sobel_x = torch.tensor(
             [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32
