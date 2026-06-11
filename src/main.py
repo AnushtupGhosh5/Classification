@@ -206,7 +206,7 @@ def main():
         if args.expert_mode == "multi_layer":
             print(f"Expert mode: multi_layer | Backbone: {args.backbone1}")
         else:
-            print(f"Expert mode: multi_backbone | {args.backbone1}(semantic) + {args.backbone2}(frequency) + {args.backbone3}(geometry)")
+            print(f"Expert mode: multi_backbone | {args.backbone1} + {args.backbone2} + {args.backbone3}")
         if args.model == "cef":
             print(f"Top-K: {args.top_k}")
         elif args.model == "edf":

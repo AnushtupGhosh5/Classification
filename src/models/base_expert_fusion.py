@@ -2,20 +2,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.expert_branches import (
-    SemanticExpert,
-    FrequencyExpert,
-    GeometryExpert,
-    MultiLayerExpert,
-)
+from src.models.expert_branches import SemanticExpert, MultiLayerExpert
 
 
 class BaseExpertFusion(nn.Module):
     def __init__(
         self,
-        semantic_expert=None,
-        frequency_expert=None,
-        geometry_expert=None,
+        expert1=None,
+        expert2=None,
+        expert3=None,
         proj_dim=256,
         num_classes=2,
         expert_mode="multi_backbone",
@@ -26,13 +21,13 @@ class BaseExpertFusion(nn.Module):
         self.proj_dim = proj_dim
 
         if expert_mode == "multi_backbone":
-            self.semantic_expert = semantic_expert
-            self.frequency_expert = frequency_expert
-            self.geometry_expert = geometry_expert
+            self.expert1 = expert1
+            self.expert2 = expert2
+            self.expert3 = expert3
 
-            self.proj_s = nn.Conv2d(semantic_expert.feature_dim, proj_dim, 1)
-            self.proj_f = nn.Conv2d(frequency_expert.feature_dim, proj_dim, 1)
-            self.proj_g = nn.Conv2d(geometry_expert.feature_dim, proj_dim, 1)
+            self.proj_s = nn.Conv2d(expert1.feature_dim, proj_dim, 1)
+            self.proj_f = nn.Conv2d(expert2.feature_dim, proj_dim, 1)
+            self.proj_g = nn.Conv2d(expert3.feature_dim, proj_dim, 1)
 
         elif expert_mode == "multi_layer":
             self.multi_layer_expert = multi_layer_expert
@@ -75,13 +70,13 @@ class BaseExpertFusion(nn.Module):
         if self.expert_mode == "multi_layer":
             f1, f2, f3 = self.multi_layer_expert(x)
         else:
-            f1 = self.semantic_expert(x)
-            f2 = self.frequency_expert(x)
-            f3 = self.geometry_expert(x)
+            f1 = self.expert1(x)
+            f2 = self.expert2(x)
+            f3 = self.expert3(x)
 
-            f1 = self._to_4d(f1, self.semantic_expert)
-            f2 = self._to_4d(f2, self.frequency_expert)
-            f3 = self._to_4d(f3, self.geometry_expert)
+            f1 = self._to_4d(f1, self.expert1)
+            f2 = self._to_4d(f2, self.expert2)
+            f3 = self._to_4d(f3, self.expert3)
 
         f1 = self.proj_s(f1)
         f2 = self.proj_f(f2)

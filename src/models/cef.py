@@ -2,21 +2,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.expert_branches import (
-    SemanticExpert,
-    FrequencyExpert,
-    GeometryExpert,
-    MultiLayerExpert,
-)
+from src.models.expert_branches import SemanticExpert, MultiLayerExpert
 from src.models.base_expert_fusion import BaseExpertFusion
 
 
 class CompetitiveExpertFusion(BaseExpertFusion):
     def __init__(
         self,
-        semantic_expert=None,
-        frequency_expert=None,
-        geometry_expert=None,
+        expert1=None,
+        expert2=None,
+        expert3=None,
         proj_dim=256,
         num_classes=2,
         top_k=2,
@@ -24,9 +19,9 @@ class CompetitiveExpertFusion(BaseExpertFusion):
         multi_layer_expert=None,
     ):
         super().__init__(
-            semantic_expert=semantic_expert,
-            frequency_expert=frequency_expert,
-            geometry_expert=geometry_expert,
+            expert1=expert1,
+            expert2=expert2,
+            expert3=expert3,
             proj_dim=proj_dim,
             num_classes=num_classes,
             expert_mode=expert_mode,
@@ -83,13 +78,13 @@ def create_cef(
             multi_layer_expert=ml_expert,
         )
     else:
-        semantic = SemanticExpert(backbone1, pretrained)
-        frequency = FrequencyExpert(backbone2, pretrained)
-        geometry = GeometryExpert(backbone3, pretrained)
+        expert1 = SemanticExpert(backbone1, pretrained)
+        expert2 = SemanticExpert(backbone2, pretrained)
+        expert3 = SemanticExpert(backbone3, pretrained)
         model = CompetitiveExpertFusion(
-            semantic_expert=semantic,
-            frequency_expert=frequency,
-            geometry_expert=geometry,
+            expert1=expert1,
+            expert2=expert2,
+            expert3=expert3,
             proj_dim=proj_dim,
             num_classes=num_classes,
             top_k=top_k,
