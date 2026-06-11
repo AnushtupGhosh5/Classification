@@ -181,8 +181,8 @@ def create_caef(
         )
     else:
         expert1 = SemanticExpert(backbone1, pretrained)
-        expert2 = FrequencyExpert(backbone2, pretrained)
-        expert3 = GeometryExpert(backbone3, pretrained)
+        expert2 = FrequencyExpert(backbone2, pretrained=False)
+        expert3 = GeometryExpert(backbone3, pretrained=False)
         model = ConfidenceAwareExpertFusion(
             expert1=expert1,
             expert2=expert2,
