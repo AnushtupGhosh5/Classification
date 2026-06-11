@@ -196,7 +196,7 @@ def create_caef(
         geometry = GeometryExpert(backbone3, pretrained)
         model = ConfidenceAwareExpertFusion(
             semantic_expert=semantic,
-            frequency_expert=frequency_expert,
+            frequency_expert=frequency,
             geometry_expert=geometry,
             proj_dim=proj_dim,
             num_classes=num_classes,
