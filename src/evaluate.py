@@ -82,12 +82,13 @@ def run_test_evaluation(model, test_loader, class_names, num_classes, device,
 
     if is_expert_fusion:
         visualize_gradcam_per_expert(
-            model, test_loader, device, save_dir, model_label, num_images=4,
+            model, test_loader, device, save_dir, model_label,
+            num_images=4, class_names=class_names,
         )
     else:
         visualize_gradcam(
             model, test_loader, device, save_dir, model_label,
-            num_images=8, model_name=model_name,
+            num_images=8, model_name=model_name, class_names=class_names,
         )
 
     metrics["macro_auc"] = round(macro_auc, 4)

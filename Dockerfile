@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir tqdm==4.66.4
 RUN pip install --no-cache-dir pandas==2.2.2
 RUN pip install --no-cache-dir Pillow==10.3.0
 RUN pip install --no-cache-dir seaborn==0.13.2
+RUN pip install --no-cache-dir --no-deps grad-cam ttach
 
 WORKDIR /app
 
