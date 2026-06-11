@@ -22,7 +22,7 @@ def unfreeze_all(model):
         param.requires_grad = True
 
 
-def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes):
+def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes, scaler=None):
     model.train()
     running_loss = 0.0
     all_preds = []
@@ -33,15 +33,28 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes
         labels = labels.to(device)
 
         optimizer.zero_grad()
-        result = model(images)
-        if isinstance(result, dict):
-            outputs = result["logits"]
-            loss = criterion(outputs, labels) + result.get("aux_loss", 0.0)
+        if scaler is not None:
+            with torch.amp.autocast(device_type="cuda"):
+                result = model(images)
+                if isinstance(result, dict):
+                    outputs = result["logits"]
+                    loss = criterion(outputs, labels) + result.get("aux_loss", 0.0)
+                else:
+                    outputs = result
+                    loss = criterion(outputs, labels)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
         else:
-            outputs = result
-            loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
+            result = model(images)
+            if isinstance(result, dict):
+                outputs = result["logits"]
+                loss = criterion(outputs, labels) + result.get("aux_loss", 0.0)
+            else:
+                outputs = result
+                loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
 
         running_loss += loss.item() * images.size(0)
         preds = outputs.argmax(dim=1)
@@ -78,10 +91,10 @@ def _log_epoch(prefix, train_m, val_m, test_m):
 
 def _run_epoch(epoch, num_epochs, stage_label, model, train_loader, val_loader,
                test_loader, criterion, optimizer, device, num_classes, scheduler,
-               history, best_val_loss, save_dir, model_name):
+               history, best_val_loss, save_dir, model_name, scaler=None):
     print(f"\nEpoch {epoch}/{num_epochs} [{stage_label}]")
 
-    train_metrics = train_one_epoch(model, train_loader, criterion, optimizer, device, num_classes)
+    train_metrics = train_one_epoch(model, train_loader, criterion, optimizer, device, num_classes, scaler)
     val_metrics, _ = evaluate_model(model, val_loader, criterion, device, num_classes)
     test_metrics, _ = evaluate_model(model, test_loader, criterion, device, num_classes)
 
@@ -115,6 +128,7 @@ def train_model(
     model_name,
     save_dir,
     skip_freeze=False,
+    use_amp=False,
 ):
     os.makedirs(save_dir, exist_ok=True)
 
@@ -125,11 +139,15 @@ def train_model(
         "test": [],
     }
 
+    scaler = torch.amp.GradScaler("cuda") if (use_amp and device.type == "cuda") else None
+
     print(f"\n{'='*60}")
     if skip_freeze:
         print(f"Training: {model_name} | Epochs: {num_epochs} (full fine-tune)")
     else:
         print(f"Training: {model_name} | Epochs: {num_epochs} (freeze: {freeze_epochs})")
+    if scaler is not None:
+        print(f"Mixed precision (AMP): enabled")
     print(f"{'='*60}")
 
     if skip_freeze:
@@ -141,7 +159,8 @@ def train_model(
             best_val_loss = _run_epoch(
                 epoch, num_epochs, "Full Fine-tune", model, train_loader,
                 val_loader, test_loader, criterion, optimizer, device,
-                num_classes, scheduler, history, best_val_loss, save_dir, model_name,
+                num_classes, scheduler, history, best_val_loss, save_dir,
+                model_name, scaler,
             )
     else:
         if freeze_epochs > 0:
@@ -156,7 +175,7 @@ def train_model(
                     epoch, num_epochs, "Stage 1 - Frozen", model, train_loader,
                     val_loader, test_loader, criterion, stage1_optimizer, device,
                     num_classes, stage1_scheduler, history, best_val_loss,
-                    save_dir, model_name,
+                    save_dir, model_name, scaler,
                 )
 
         stage2_epochs = num_epochs - freeze_epochs
@@ -179,7 +198,8 @@ def train_model(
                 best_val_loss = _run_epoch(
                     epoch, num_epochs, "Stage 2 - Fine-tune", model, train_loader,
                     val_loader, test_loader, criterion, stage2_optimizer, device,
-                    num_classes, scheduler, history, best_val_loss, save_dir, model_name,
+                    num_classes, scheduler, history, best_val_loss, save_dir,
+                    model_name, scaler,
                 )
 
     final_metrics = {

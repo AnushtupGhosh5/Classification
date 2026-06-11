@@ -178,6 +178,8 @@ def main():
     parser.add_argument("--output-dir", type=str, default="outputs")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--amp", action="store_true",
+                        help="Use mixed precision (FP16) training to reduce GPU memory")
     args = parser.parse_args()
 
     config = get_dataset_config(args.dataset)
@@ -305,6 +307,7 @@ def main():
         model_name=model_label,
         save_dir=model_save_dir,
         skip_freeze=is_vit,
+        use_amp=args.amp,
     )
 
     plot_training_curves(final_metrics["history"], results_dir, model_label)
