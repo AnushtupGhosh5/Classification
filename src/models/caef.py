@@ -2,27 +2,25 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.expert_branches import SemanticExpert, FrequencyExpert, GeometryExpert, MultiLayerExpert
 from src.models.base_expert_fusion import BaseExpertFusion
+from src.models.expert_branches import MultiLayerExpert
 
 
 class ConfidenceAwareExpertFusion(BaseExpertFusion):
     def __init__(
         self,
-        expert1=None,
-        expert2=None,
-        expert3=None,
+        backbone_name="resnet50",
+        pretrained=True,
         proj_dim=256,
         num_classes=2,
         confidence_type="scalar",
         fuzzy_lambda=0.1,
-        expert_mode="multi_backbone",
+        expert_mode="shared_base",
         multi_layer_expert=None,
     ):
         super().__init__(
-            expert1=expert1,
-            expert2=expert2,
-            expert3=expert3,
+            backbone_name=backbone_name,
+            pretrained=pretrained,
             proj_dim=proj_dim,
             num_classes=num_classes,
             expert_mode=expert_mode,
@@ -87,6 +85,18 @@ class ConfidenceAwareExpertFusion(BaseExpertFusion):
     def _pool_features(self, f):
         return F.adaptive_avg_pool2d(f, (1, 1)).flatten(1)
 
+    def _fuzzy_values(self, pooled, mu_head, nu_head):
+        """Compute constrained fuzzy membership values.
+
+        mu = sigma(raw_mu)
+        nu = sigma(raw_nu) * (1 - mu)   -- enforces mu + nu <= 1
+        pi = 1 - mu - nu                 -- guaranteed >= 0
+        """
+        mu = mu_head(pooled)
+        nu = nu_head(pooled) * (1.0 - mu)
+        pi = 1.0 - mu - nu
+        return mu, nu, pi
+
     def forward(self, x):
         fs, ff, fg = self.extract_expert_features(x)
         ps, pf, pg = self._pool_features(fs), self._pool_features(ff), self._pool_features(fg)
@@ -128,17 +138,9 @@ class ConfidenceAwareExpertFusion(BaseExpertFusion):
             return self.pool_and_classify(fused)
 
         if self.confidence_type == "fuzzy":
-            mu_s = self.mu_head_s(ps)
-            nu_s = self.nu_head_s(ps)
-            pi_s = 1 - mu_s - nu_s
-
-            mu_f = self.mu_head_f(pf)
-            nu_f = self.nu_head_f(pf)
-            pi_f = 1 - mu_f - nu_f
-
-            mu_g = self.mu_head_g(pg)
-            nu_g = self.nu_head_g(pg)
-            pi_g = 1 - mu_g - nu_g
+            mu_s, nu_s, pi_s = self._fuzzy_values(ps, self.mu_head_s, self.nu_head_s)
+            mu_f, nu_f, pi_f = self._fuzzy_values(pf, self.mu_head_f, self.nu_head_f)
+            mu_g, nu_g, pi_g = self._fuzzy_values(pg, self.mu_head_g, self.nu_head_g)
 
             r_s = mu_s * (1 - pi_s)
             r_f = mu_f * (1 - pi_f)
@@ -151,11 +153,12 @@ class ConfidenceAwareExpertFusion(BaseExpertFusion):
             fused = ws * fs + wf * ff + wg * fg
 
             logits = self.pool_and_classify(fused)
-            aux_loss = self.fuzzy_lambda * (
-                torch.mean(torch.abs(mu_s + nu_s + pi_s - 1))
-                + torch.mean(torch.abs(mu_f + nu_f + pi_f - 1))
-                + torch.mean(torch.abs(mu_g + nu_g + pi_g - 1))
-            )
+
+            # Reliability diversity loss: encourage experts to have
+            # different confidence levels (promotes specialization)
+            r_means = torch.stack([r_s.mean(), r_f.mean(), r_g.mean()])
+            aux_loss = self.fuzzy_lambda * (-r_means.var())
+
             return {"logits": logits, "aux_loss": aux_loss}
 
 
@@ -164,15 +167,17 @@ def create_caef(
     pretrained=True,
     attention=None,
     backbone1="resnet50",
-    backbone2="mobilenetv2",
-    backbone3="densenet121",
+    backbone2=None,
+    backbone3=None,
     proj_dim=256,
     confidence_type="scalar",
-    expert_mode="multi_backbone",
+    expert_mode="shared_base",
 ):
     if expert_mode == "multi_layer":
         ml_expert = MultiLayerExpert(backbone1, pretrained)
         model = ConfidenceAwareExpertFusion(
+            backbone_name=backbone1,
+            pretrained=pretrained,
             proj_dim=proj_dim,
             num_classes=num_classes,
             confidence_type=confidence_type,
@@ -180,16 +185,12 @@ def create_caef(
             multi_layer_expert=ml_expert,
         )
     else:
-        expert1 = SemanticExpert(backbone1, pretrained)
-        expert2 = FrequencyExpert(backbone2, pretrained=False)
-        expert3 = GeometryExpert(backbone3, pretrained=False)
         model = ConfidenceAwareExpertFusion(
-            expert1=expert1,
-            expert2=expert2,
-            expert3=expert3,
+            backbone_name=backbone1,
+            pretrained=pretrained,
             proj_dim=proj_dim,
             num_classes=num_classes,
             confidence_type=confidence_type,
-            expert_mode="multi_backbone",
+            expert_mode="shared_base",
         )
     return model, "head"

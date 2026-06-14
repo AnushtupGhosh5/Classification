@@ -2,26 +2,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.expert_branches import SemanticExpert, FrequencyExpert, GeometryExpert, MultiLayerExpert
 from src.models.base_expert_fusion import BaseExpertFusion
+from src.models.expert_branches import MultiLayerExpert
 
 
 class CompetitiveExpertFusion(BaseExpertFusion):
     def __init__(
         self,
-        expert1=None,
-        expert2=None,
-        expert3=None,
+        backbone_name="resnet50",
+        pretrained=True,
         proj_dim=256,
         num_classes=2,
         top_k=2,
-        expert_mode="multi_backbone",
+        expert_mode="shared_base",
         multi_layer_expert=None,
     ):
         super().__init__(
-            expert1=expert1,
-            expert2=expert2,
-            expert3=expert3,
+            backbone_name=backbone_name,
+            pretrained=pretrained,
             proj_dim=proj_dim,
             num_classes=num_classes,
             expert_mode=expert_mode,
@@ -45,6 +43,9 @@ class CompetitiveExpertFusion(BaseExpertFusion):
 
         topk_vals, topk_idx = scores.topk(self.top_k, dim=1)
 
+        # Renormalize selected weights to sum to 1
+        topk_vals = topk_vals / (topk_vals.sum(dim=1, keepdim=True) + 1e-8)
+
         experts = [fs, ff, fg]
         fused = torch.zeros_like(fs)
         for k in range(self.top_k):
@@ -62,15 +63,17 @@ def create_cef(
     pretrained=True,
     attention=None,
     backbone1="resnet50",
-    backbone2="mobilenetv2",
-    backbone3="densenet121",
+    backbone2=None,
+    backbone3=None,
     proj_dim=256,
     top_k=2,
-    expert_mode="multi_backbone",
+    expert_mode="shared_base",
 ):
     if expert_mode == "multi_layer":
         ml_expert = MultiLayerExpert(backbone1, pretrained)
         model = CompetitiveExpertFusion(
+            backbone_name=backbone1,
+            pretrained=pretrained,
             proj_dim=proj_dim,
             num_classes=num_classes,
             top_k=top_k,
@@ -78,16 +81,12 @@ def create_cef(
             multi_layer_expert=ml_expert,
         )
     else:
-        expert1 = SemanticExpert(backbone1, pretrained)
-        expert2 = FrequencyExpert(backbone2, pretrained=False)
-        expert3 = GeometryExpert(backbone3, pretrained=False)
         model = CompetitiveExpertFusion(
-            expert1=expert1,
-            expert2=expert2,
-            expert3=expert3,
+            backbone_name=backbone1,
+            pretrained=pretrained,
             proj_dim=proj_dim,
             num_classes=num_classes,
             top_k=top_k,
-            expert_mode="multi_backbone",
+            expert_mode="shared_base",
         )
     return model, "head"

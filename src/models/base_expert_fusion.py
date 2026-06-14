@@ -2,32 +2,54 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.expert_branches import SemanticExpert, FrequencyExpert, GeometryExpert, MultiLayerExpert
+from src.models.backbone_extractor import create_backbone
+from src.models.expert_branches import (
+    SemanticBranch, FrequencyBranch, GeometryBranch, MultiLayerExpert,
+)
+
+
+SHARED_BASE_EXCLUDED = {"vit_b16", "vit_b32"}
 
 
 class BaseExpertFusion(nn.Module):
+    """Shared-base expert fusion architecture.
+
+    Pipeline: Input -> [Shared Backbone] -> F_base
+              -> [SemanticBranch | FrequencyBranch | GeometryBranch]
+              -> (Fs, Ff, Fg) -> [Fusion Method] -> Head -> logits
+
+    expert_mode:
+      - "shared_base" (default): one shared backbone + 3 lightweight branches
+      - "multi_layer": one backbone, features from 3 different layers
+    """
+
     def __init__(
         self,
-        expert1=None,
-        expert2=None,
-        expert3=None,
+        backbone_name="resnet50",
+        pretrained=True,
         proj_dim=256,
         num_classes=2,
-        expert_mode="multi_backbone",
+        expert_mode="shared_base",
         multi_layer_expert=None,
     ):
         super().__init__()
         self.expert_mode = expert_mode
         self.proj_dim = proj_dim
 
-        if expert_mode == "multi_backbone":
-            self.expert1 = expert1
-            self.expert2 = expert2
-            self.expert3 = expert3
+        if expert_mode == "shared_base":
+            if backbone_name in SHARED_BASE_EXCLUDED:
+                raise ValueError(
+                    f"shared_base mode not supported for {backbone_name}. "
+                    f"ViT models produce 1D features without spatial structure."
+                )
+            self.shared_backbone = create_backbone(backbone_name, pretrained)
+            in_channels = self.shared_backbone.feature_dim
 
-            self.proj_s = nn.Conv2d(expert1.feature_dim, proj_dim, 1)
-            self.proj_f = nn.Conv2d(expert2.feature_dim, proj_dim, 1)
-            self.proj_g = nn.Conv2d(expert3.feature_dim, proj_dim, 1)
+            self.semantic_branch = SemanticBranch(in_channels, proj_dim)
+            self.frequency_branch = FrequencyBranch(in_channels, proj_dim)
+            self.geometry_branch = GeometryBranch(in_channels, proj_dim)
+
+            self._backbone_module_name = "shared_backbone"
 
         elif expert_mode == "multi_layer":
             self.multi_layer_expert = multi_layer_expert
@@ -37,6 +59,11 @@ class BaseExpertFusion(nn.Module):
             self.proj_f = nn.Conv2d(channels[1], proj_dim, 1)
             self.proj_g = nn.Conv2d(channels[2], proj_dim, 1)
 
+            self._backbone_module_name = "multi_layer_expert"
+
+        else:
+            raise ValueError(f"Unknown expert_mode '{expert_mode}'")
+
         self.head = nn.Sequential(
             nn.BatchNorm1d(proj_dim),
             nn.Dropout(0.4),
@@ -45,11 +72,6 @@ class BaseExpertFusion(nn.Module):
             nn.Dropout(0.3),
             nn.Linear(512, num_classes),
         )
-
-    def _to_4d(self, features, expert):
-        if not expert.is_2d:
-            return features.unsqueeze(-1).unsqueeze(-1)
-        return features
 
     def _align_features(self, features_list):
         min_h = min(f.shape[2] for f in features_list)
@@ -69,18 +91,19 @@ class BaseExpertFusion(nn.Module):
     def extract_expert_features(self, x):
         if self.expert_mode == "multi_layer":
             f1, f2, f3 = self.multi_layer_expert(x)
+            f1 = self.proj_s(f1)
+            f2 = self.proj_f(f2)
+            f3 = self.proj_g(f3)
         else:
-            f1 = self.expert1(x)
-            f2 = self.expert2(x)
-            f3 = self.expert3(x)
-
-            f1 = self._to_4d(f1, self.expert1)
-            f2 = self._to_4d(f2, self.expert2)
-            f3 = self._to_4d(f3, self.expert3)
-
-        f1 = self.proj_s(f1)
-        f2 = self.proj_f(f2)
-        f3 = self.proj_g(f3)
+            f_base = self.shared_backbone(x)
+            if f_base.dim() != 4:
+                raise ValueError(
+                    f"Shared backbone must produce 4D features, got shape {f_base.shape}"
+                )
+            fs = self.semantic_branch(f_base)
+            ff = self.frequency_branch(f_base)
+            fg = self.geometry_branch(f_base)
+            f1, f2, f3 = fs, ff, fg
 
         f1, f2, f3 = self._align_features([f1, f2, f3])
         return f1, f2, f3

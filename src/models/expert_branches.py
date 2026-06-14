@@ -18,62 +18,66 @@ def reset_batchnorm(module):
                 m.num_batches_tracked.zero_()
 
 
-class SemanticExpert(nn.Module):
-    def __init__(self, backbone_name, pretrained=True):
+# ---------------------------------------------------------------------------
+# Lightweight expert branches — operate on shared backbone features F_base
+# ---------------------------------------------------------------------------
+
+class SemanticBranch(nn.Module):
+    """Pure learned conv block that specializes on semantic content of F_base."""
+
+    def __init__(self, in_channels, proj_dim):
         super().__init__()
-        self.extractor = create_backbone(backbone_name, pretrained)
-        self.feature_dim = self.extractor.feature_dim
-        self.is_2d = self.extractor.is_2d
-
-    def forward(self, x):
-        return self.extractor(x)
-
-
-class FrequencyExpert(nn.Module):
-    def __init__(self, backbone_name, pretrained=True):
-        super().__init__()
-        self.extractor = create_backbone(backbone_name, pretrained)
-        self.feature_dim = self.extractor.feature_dim
-        self.is_2d = self.extractor.is_2d
-        reset_batchnorm(self.extractor)
-        self.adapter = nn.Sequential(
-            nn.Conv2d(3, 16, 3, padding=1, bias=False),
-            nn.BatchNorm2d(16),
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, proj_dim, 1, bias=False),
+            nn.BatchNorm2d(proj_dim),
             nn.ReLU(inplace=True),
-            nn.Conv2d(16, 3, 3, padding=1, bias=False),
-            nn.BatchNorm2d(3),
+            nn.Conv2d(proj_dim, proj_dim, 3, padding=1, bias=False),
+            nn.BatchNorm2d(proj_dim),
+            nn.ReLU(inplace=True),
         )
 
-    def preprocess(self, x):
-        x_complex = torch.fft.fft2(x, norm="ortho")
-        magnitude = torch.abs(x_complex)
-        magnitude = torch.log1p(magnitude)
-        B, C, H, W = magnitude.shape
-        flat = magnitude.view(B, C, -1)
-        mag_min = flat.min(dim=-1, keepdim=True)[0].unsqueeze(-1)
-        mag_max = flat.max(dim=-1, keepdim=True)[0].unsqueeze(-1)
-        magnitude = (magnitude - mag_min) / (mag_max - mag_min + 1e-8)
-        return magnitude
+    def forward(self, x):
+        return self.conv(x)
+
+
+class FrequencyBranch(nn.Module):
+    """FFT-based frequency extraction on shared features + learned conv."""
+
+    def __init__(self, in_channels, proj_dim):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Conv2d(in_channels, proj_dim, 1, bias=False),
+            nn.BatchNorm2d(proj_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.conv = nn.Sequential(
+            nn.Conv2d(proj_dim, proj_dim, 3, padding=1, bias=False),
+            nn.BatchNorm2d(proj_dim),
+            nn.ReLU(inplace=True),
+        )
 
     def forward(self, x):
-        x_freq = self.preprocess(x)
-        x_adapted = self.adapter(x_freq)
-        return self.extractor(x_adapted)
+        x = self.proj(x)
+        fft = torch.fft.fft2(x, norm="ortho")
+        magnitude = torch.log1p(torch.abs(fft))
+        magnitude = torch.fft.fftshift(magnitude, dim=(-2, -1))
+        return self.conv(magnitude)
 
 
-class GeometryExpert(nn.Module):
-    def __init__(self, backbone_name, pretrained=True):
+class GeometryBranch(nn.Module):
+    """Sobel gradient extraction on shared features + learned conv."""
+
+    def __init__(self, in_channels, proj_dim):
         super().__init__()
-        self.extractor = create_backbone(backbone_name, pretrained)
-        self.feature_dim = self.extractor.feature_dim
-        self.is_2d = self.extractor.is_2d
-        reset_batchnorm(self.extractor)
-        self.adapter = nn.Sequential(
-            nn.Conv2d(3, 16, 3, padding=1, bias=False),
-            nn.BatchNorm2d(16),
+        self.proj = nn.Sequential(
+            nn.Conv2d(in_channels, proj_dim, 1, bias=False),
+            nn.BatchNorm2d(proj_dim),
             nn.ReLU(inplace=True),
-            nn.Conv2d(16, 3, 3, padding=1, bias=False),
-            nn.BatchNorm2d(3),
+        )
+        self.conv = nn.Sequential(
+            nn.Conv2d(proj_dim, proj_dim, 3, padding=1, bias=False),
+            nn.BatchNorm2d(proj_dim),
+            nn.ReLU(inplace=True),
         )
 
         sobel_x = torch.tensor(
@@ -83,30 +87,23 @@ class GeometryExpert(nn.Module):
             [[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32
         )
         self.register_buffer(
-            "sobel_x_kernel",
-            sobel_x.unsqueeze(0).unsqueeze(0).repeat(3, 1, 1, 1),
+            "sobel_x_kernel", sobel_x.unsqueeze(0).unsqueeze(0).expand(proj_dim, 1, 3, 3).contiguous()
         )
         self.register_buffer(
-            "sobel_y_kernel",
-            sobel_y.unsqueeze(0).unsqueeze(0).repeat(3, 1, 1, 1),
+            "sobel_y_kernel", sobel_y.unsqueeze(0).unsqueeze(0).expand(proj_dim, 1, 3, 3).contiguous()
         )
 
-    def preprocess(self, x):
-        gx = F.conv2d(x, self.sobel_x_kernel, padding=1, groups=3)
-        gy = F.conv2d(x, self.sobel_y_kernel, padding=1, groups=3)
-        magnitude = torch.sqrt(gx ** 2 + gy ** 2 + 1e-8)
-        B, C, H, W = magnitude.shape
-        flat = magnitude.view(B, C, -1)
-        mag_min = flat.min(dim=-1, keepdim=True)[0].unsqueeze(-1)
-        mag_max = flat.max(dim=-1, keepdim=True)[0].unsqueeze(-1)
-        magnitude = (magnitude - mag_min) / (mag_max - mag_min + 1e-8)
-        return magnitude
-
     def forward(self, x):
-        x_geo = self.preprocess(x)
-        x_adapted = self.adapter(x_geo)
-        return self.extractor(x_adapted)
+        x = self.proj(x)
+        gx = F.conv2d(x, self.sobel_x_kernel, padding=1, groups=x.shape[1])
+        gy = F.conv2d(x, self.sobel_y_kernel, padding=1, groups=x.shape[1])
+        grad = torch.sqrt(gx ** 2 + gy ** 2 + 1e-8)
+        return self.conv(grad)
 
+
+# ---------------------------------------------------------------------------
+# Multi-layer expert (kept as alternative expert mode)
+# ---------------------------------------------------------------------------
 
 MULTI_LAYER_EXCLUDED = {"vit_b16", "vit_b32"}
 

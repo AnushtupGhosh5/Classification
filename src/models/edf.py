@@ -2,26 +2,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.expert_branches import SemanticExpert, FrequencyExpert, GeometryExpert, MultiLayerExpert
 from src.models.base_expert_fusion import BaseExpertFusion
+from src.models.expert_branches import MultiLayerExpert
 
 
 class ExpertDisagreementFusion(BaseExpertFusion):
     def __init__(
         self,
-        expert1=None,
-        expert2=None,
-        expert3=None,
+        backbone_name="resnet50",
+        pretrained=True,
         proj_dim=256,
         num_classes=2,
         disagreement_type="abs",
-        expert_mode="multi_backbone",
+        expert_mode="shared_base",
         multi_layer_expert=None,
     ):
         super().__init__(
-            expert1=expert1,
-            expert2=expert2,
-            expert3=expert3,
+            backbone_name=backbone_name,
+            pretrained=pretrained,
             proj_dim=proj_dim,
             num_classes=num_classes,
             expert_mode=expert_mode,
@@ -91,15 +89,17 @@ def create_edf(
     pretrained=True,
     attention=None,
     backbone1="resnet50",
-    backbone2="mobilenetv2",
-    backbone3="densenet121",
+    backbone2=None,
+    backbone3=None,
     proj_dim=256,
     disagreement_type="abs",
-    expert_mode="multi_backbone",
+    expert_mode="shared_base",
 ):
     if expert_mode == "multi_layer":
         ml_expert = MultiLayerExpert(backbone1, pretrained)
         model = ExpertDisagreementFusion(
+            backbone_name=backbone1,
+            pretrained=pretrained,
             proj_dim=proj_dim,
             num_classes=num_classes,
             disagreement_type=disagreement_type,
@@ -107,16 +107,12 @@ def create_edf(
             multi_layer_expert=ml_expert,
         )
     else:
-        expert1 = SemanticExpert(backbone1, pretrained)
-        expert2 = FrequencyExpert(backbone2, pretrained=False)
-        expert3 = GeometryExpert(backbone3, pretrained=False)
         model = ExpertDisagreementFusion(
-            expert1=expert1,
-            expert2=expert2,
-            expert3=expert3,
+            backbone_name=backbone1,
+            pretrained=pretrained,
             proj_dim=proj_dim,
             num_classes=num_classes,
             disagreement_type=disagreement_type,
-            expert_mode="multi_backbone",
+            expert_mode="shared_base",
         )
     return model, "head"
