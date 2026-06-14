@@ -180,10 +180,10 @@ def visualize_gradcam_per_expert(
     os.makedirs(save_dir, exist_ok=True)
 
     expert_targets = []
-    if hasattr(model, "expert1"):
-        for i, attr in enumerate(["expert1", "expert2", "expert3"]):
-            expert = getattr(model, attr)
-            target = _find_deepest_conv(expert)
+    if hasattr(model, "semantic_branch"):
+        for i, attr in enumerate(["semantic_branch", "frequency_branch", "geometry_branch"]):
+            branch = getattr(model, attr)
+            target = _find_deepest_conv(branch)
             expert_targets.append(target)
         if expert_names is None:
             expert_names = ["Semantic", "Frequency", "Geometry"]

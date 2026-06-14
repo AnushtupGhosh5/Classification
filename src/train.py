@@ -10,11 +10,20 @@ from src.utils import evaluate_model, compute_metrics
 
 
 def freeze_backbone(model, head_name):
-    for param in model.parameters():
-        param.requires_grad = False
-    head = getattr(model, head_name)
-    for param in head.parameters():
-        param.requires_grad = True
+    backbone_name = getattr(model, "_backbone_module_name", None)
+    if backbone_name is not None:
+        # Expert fusion: freeze ONLY the shared backbone
+        # Expert branches + fusion modules + head remain trainable
+        backbone = getattr(model, backbone_name)
+        for param in backbone.parameters():
+            param.requires_grad = False
+    else:
+        # Regular model: freeze all, unfreeze head only
+        for param in model.parameters():
+            param.requires_grad = False
+        head = getattr(model, head_name)
+        for param in head.parameters():
+            param.requires_grad = True
 
 
 def unfreeze_all(model):
@@ -166,8 +175,10 @@ def train_model(
         if freeze_epochs > 0:
             print(f"\n--- Stage 1: Frozen backbone ({freeze_epochs} epochs) ---")
             freeze_backbone(model, head_name)
-            head = getattr(model, head_name)
-            stage1_optimizer = torch.optim.Adam(head.parameters(), lr=lr)
+            # For expert fusion: backbone frozen but branches/fusion/head trainable
+            # For regular models: only head is trainable
+            trainable = [p for p in model.parameters() if p.requires_grad]
+            stage1_optimizer = torch.optim.Adam(trainable, lr=lr)
             stage1_scheduler = ReduceLROnPlateau(stage1_optimizer, mode="min", factor=0.5, patience=15, min_lr=1e-7)
 
             for epoch in range(1, freeze_epochs + 1):
@@ -184,14 +195,34 @@ def train_model(
             unfreeze_all(model)
 
             head = getattr(model, head_name)
-            head_params = set(id(p) for p in head.parameters())
-            backbone_params = [p for p in model.parameters() if id(p) not in head_params]
             head_params_list = list(head.parameters())
+            head_param_ids = set(id(p) for p in head_params_list)
 
-            stage2_optimizer = torch.optim.Adam([
-                {"params": backbone_params, "lr": lr / 10},
-                {"params": head_params_list, "lr": lr},
-            ])
+            backbone_name = getattr(model, "_backbone_module_name", None)
+
+            if backbone_name is not None:
+                # Expert fusion: 3-tier LR (backbone lr/10, branches+fusion lr/5, head lr)
+                backbone = getattr(model, backbone_name)
+                backbone_params = list(backbone.parameters())
+                backbone_param_ids = set(id(p) for p in backbone_params)
+                middle_params = [
+                    p for p in model.parameters()
+                    if id(p) not in backbone_param_ids and id(p) not in head_param_ids
+                ]
+                stage2_optimizer = torch.optim.Adam([
+                    {"params": backbone_params, "lr": lr / 10},
+                    {"params": middle_params, "lr": lr / 5},
+                    {"params": head_params_list, "lr": lr},
+                ])
+            else:
+                # Regular model: 2-tier LR (backbone lr/10, head lr)
+                backbone_params = [
+                    p for p in model.parameters() if id(p) not in head_param_ids
+                ]
+                stage2_optimizer = torch.optim.Adam([
+                    {"params": backbone_params, "lr": lr / 10},
+                    {"params": head_params_list, "lr": lr},
+                ])
             scheduler = ReduceLROnPlateau(stage2_optimizer, mode="min", factor=0.5, patience=15, min_lr=1e-7)
 
             for epoch in range(freeze_epochs + 1, num_epochs + 1):

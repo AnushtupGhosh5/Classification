@@ -163,9 +163,9 @@ def main():
                         help="Confidence estimation type in CAEF")
     parser.add_argument("--proj-dim", type=int, default=256,
                         help="Common projection dimension for expert features")
-    parser.add_argument("--expert-mode", type=str, default="multi_backbone",
-                        choices=["multi_backbone", "multi_layer"],
-                        help="Expert mode: multi_backbone (3 separate backbones) or multi_layer (1 backbone, 3 layers)")
+    parser.add_argument("--expert-mode", type=str, default="shared_base",
+                        choices=["shared_base", "multi_layer"],
+                        help="Expert mode: shared_base (1 backbone + lightweight branches) or multi_layer (1 backbone, 3 layers)")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -208,7 +208,7 @@ def main():
         if args.expert_mode == "multi_layer":
             print(f"Expert mode: multi_layer | Backbone: {args.backbone1}")
         else:
-            print(f"Expert mode: multi_backbone | {args.backbone1}(semantic) + {args.backbone2}(frequency) + {args.backbone3}(geometry)")
+            print(f"Expert mode: shared_base | Backbone: {args.backbone1}")
         if args.model == "cef":
             print(f"Top-K: {args.top_k}")
         elif args.model == "edf":
@@ -276,7 +276,7 @@ def main():
         if args.expert_mode == "multi_layer":
             parts = [args.model, "ml", args.backbone1]
         else:
-            parts = [args.model, args.backbone1, args.backbone2, args.backbone3]
+            parts = [args.model, "sb", args.backbone1]
         if args.model == "cef":
             parts.append(f"top{args.top_k}")
         elif args.model == "edf":
