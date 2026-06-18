@@ -163,6 +163,8 @@ def main():
                         help="Confidence estimation type in CAEF")
     parser.add_argument("--proj-dim", type=int, default=256,
                         help="Common projection dimension for expert features")
+    parser.add_argument("--branch-depth", type=int, default=2,
+                        help="Number of residual blocks per expert branch (shared_base mode)")
     parser.add_argument("--expert-mode", type=str, default="shared_base",
                         choices=["shared_base", "multi_layer"],
                         help="Expert mode: shared_base (1 backbone + lightweight branches) or multi_layer (1 backbone, 3 layers)")
@@ -216,6 +218,7 @@ def main():
         elif args.model == "caef":
             print(f"Confidence type: {args.confidence_type}")
         print(f"Projection dim: {args.proj_dim}")
+        print(f"Branch depth: {args.branch_depth} residual blocks")
         print(f"Freeze epochs: {args.freeze_epochs} | Stage 2 epochs: {args.epochs - args.freeze_epochs}")
     elif is_dual_fusion:
         print(f"Backbones: {args.backbone1} + {args.backbone2} | Fusion mode: {args.fusion_mode}")
@@ -236,6 +239,7 @@ def main():
             backbone3=args.backbone3,
             proj_dim=args.proj_dim,
             expert_mode=args.expert_mode,
+            branch_depth=args.branch_depth,
         )
         if args.model == "cef":
             expert_kwargs["top_k"] = args.top_k

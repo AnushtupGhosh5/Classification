@@ -31,6 +31,7 @@ class BaseExpertFusion(nn.Module):
         num_classes=2,
         expert_mode="shared_base",
         multi_layer_expert=None,
+        branch_depth=2,
     ):
         super().__init__()
         self.expert_mode = expert_mode
@@ -45,9 +46,9 @@ class BaseExpertFusion(nn.Module):
             self.shared_backbone = create_backbone(backbone_name, pretrained)
             in_channels = self.shared_backbone.feature_dim
 
-            self.semantic_branch = SemanticBranch(in_channels, proj_dim)
-            self.frequency_branch = FrequencyBranch(in_channels, proj_dim)
-            self.geometry_branch = GeometryBranch(in_channels, proj_dim)
+            self.semantic_branch = SemanticBranch(in_channels, proj_dim, branch_depth)
+            self.frequency_branch = FrequencyBranch(in_channels, proj_dim, branch_depth)
+            self.geometry_branch = GeometryBranch(in_channels, proj_dim, branch_depth)
 
             self._backbone_module_name = "shared_backbone"
 

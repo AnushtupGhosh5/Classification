@@ -27,6 +27,7 @@ class MutualInfoExpertFusion(BaseExpertFusion):
         mi_bins=16,
         expert_mode="shared_base",
         multi_layer_expert=None,
+        branch_depth=2,
     ):
         super().__init__(
             backbone_name=backbone_name,
@@ -35,6 +36,7 @@ class MutualInfoExpertFusion(BaseExpertFusion):
             num_classes=num_classes,
             expert_mode=expert_mode,
             multi_layer_expert=multi_layer_expert,
+            branch_depth=branch_depth,
         )
         self.mi_dim = mi_dim
         self.mi_bins = mi_bins
@@ -156,6 +158,7 @@ def create_mief(
     backbone3=None,
     proj_dim=256,
     expert_mode="shared_base",
+    branch_depth=2,
 ):
     if expert_mode == "multi_layer":
         ml_expert = MultiLayerExpert(backbone1, pretrained)
@@ -174,5 +177,6 @@ def create_mief(
             proj_dim=proj_dim,
             num_classes=num_classes,
             expert_mode="shared_base",
+            branch_depth=branch_depth,
         )
     return model, "head"

@@ -16,6 +16,7 @@ class CompetitiveExpertFusion(BaseExpertFusion):
         top_k=2,
         expert_mode="shared_base",
         multi_layer_expert=None,
+        branch_depth=2,
     ):
         super().__init__(
             backbone_name=backbone_name,
@@ -24,6 +25,7 @@ class CompetitiveExpertFusion(BaseExpertFusion):
             num_classes=num_classes,
             expert_mode=expert_mode,
             multi_layer_expert=multi_layer_expert,
+            branch_depth=branch_depth,
         )
         self.top_k = min(top_k, 3)
 
@@ -68,6 +70,7 @@ def create_cef(
     proj_dim=256,
     top_k=2,
     expert_mode="shared_base",
+    branch_depth=2,
 ):
     if expert_mode == "multi_layer":
         ml_expert = MultiLayerExpert(backbone1, pretrained)
@@ -88,5 +91,6 @@ def create_cef(
             num_classes=num_classes,
             top_k=top_k,
             expert_mode="shared_base",
+            branch_depth=branch_depth,
         )
     return model, "head"

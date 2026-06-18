@@ -22,38 +22,55 @@ def reset_batchnorm(module):
 # Lightweight expert branches — operate on shared backbone features F_base
 # ---------------------------------------------------------------------------
 
-class SemanticBranch(nn.Module):
-    """Pure learned conv block that specializes on semantic content of F_base."""
+class ResidualBlock(nn.Module):
+    """Standard ResNet-style residual block for expert branch depth."""
 
-    def __init__(self, in_channels, proj_dim):
+    def __init__(self, channels):
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, proj_dim, 1, bias=False),
-            nn.BatchNorm2d(proj_dim),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(proj_dim, proj_dim, 3, padding=1, bias=False),
-            nn.BatchNorm2d(proj_dim),
-            nn.ReLU(inplace=True),
-        )
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
+        self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        return self.conv(x)
+        identity = x
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = out + identity
+        return self.relu(out)
 
 
-class FrequencyBranch(nn.Module):
-    """FFT-based frequency extraction on shared features + learned conv."""
+class SemanticBranch(nn.Module):
+    """Pure learned conv with residual blocks — specializes on semantic content."""
 
-    def __init__(self, in_channels, proj_dim):
+    def __init__(self, in_channels, proj_dim, num_blocks=2):
         super().__init__()
         self.proj = nn.Sequential(
             nn.Conv2d(in_channels, proj_dim, 1, bias=False),
             nn.BatchNorm2d(proj_dim),
             nn.ReLU(inplace=True),
         )
-        self.conv = nn.Sequential(
-            nn.Conv2d(proj_dim, proj_dim, 3, padding=1, bias=False),
+        self.blocks = nn.Sequential(
+            *[ResidualBlock(proj_dim) for _ in range(num_blocks)]
+        )
+
+    def forward(self, x):
+        return self.blocks(self.proj(x))
+
+
+class FrequencyBranch(nn.Module):
+    """FFT-based frequency extraction on shared features + residual blocks."""
+
+    def __init__(self, in_channels, proj_dim, num_blocks=2):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Conv2d(in_channels, proj_dim, 1, bias=False),
             nn.BatchNorm2d(proj_dim),
             nn.ReLU(inplace=True),
+        )
+        self.blocks = nn.Sequential(
+            *[ResidualBlock(proj_dim) for _ in range(num_blocks)]
         )
 
     def forward(self, x):
@@ -61,23 +78,21 @@ class FrequencyBranch(nn.Module):
         fft = torch.fft.fft2(x, norm="ortho")
         magnitude = torch.log1p(torch.abs(fft))
         magnitude = torch.fft.fftshift(magnitude, dim=(-2, -1))
-        return self.conv(magnitude)
+        return self.blocks(magnitude)
 
 
 class GeometryBranch(nn.Module):
-    """Sobel gradient extraction on shared features + learned conv."""
+    """Sobel gradient extraction on shared features + residual blocks."""
 
-    def __init__(self, in_channels, proj_dim):
+    def __init__(self, in_channels, proj_dim, num_blocks=2):
         super().__init__()
         self.proj = nn.Sequential(
             nn.Conv2d(in_channels, proj_dim, 1, bias=False),
             nn.BatchNorm2d(proj_dim),
             nn.ReLU(inplace=True),
         )
-        self.conv = nn.Sequential(
-            nn.Conv2d(proj_dim, proj_dim, 3, padding=1, bias=False),
-            nn.BatchNorm2d(proj_dim),
-            nn.ReLU(inplace=True),
+        self.blocks = nn.Sequential(
+            *[ResidualBlock(proj_dim) for _ in range(num_blocks)]
         )
 
         sobel_x = torch.tensor(
@@ -98,7 +113,7 @@ class GeometryBranch(nn.Module):
         gx = F.conv2d(x, self.sobel_x_kernel, padding=1, groups=x.shape[1])
         gy = F.conv2d(x, self.sobel_y_kernel, padding=1, groups=x.shape[1])
         grad = torch.sqrt(gx ** 2 + gy ** 2 + 1e-8)
-        return self.conv(grad)
+        return self.blocks(grad)
 
 
 # ---------------------------------------------------------------------------

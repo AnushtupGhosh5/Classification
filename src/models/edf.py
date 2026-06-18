@@ -16,6 +16,7 @@ class ExpertDisagreementFusion(BaseExpertFusion):
         disagreement_type="abs",
         expert_mode="shared_base",
         multi_layer_expert=None,
+        branch_depth=2,
     ):
         super().__init__(
             backbone_name=backbone_name,
@@ -24,6 +25,7 @@ class ExpertDisagreementFusion(BaseExpertFusion):
             num_classes=num_classes,
             expert_mode=expert_mode,
             multi_layer_expert=multi_layer_expert,
+            branch_depth=branch_depth,
         )
         self.disagreement_type = disagreement_type
 
@@ -94,6 +96,7 @@ def create_edf(
     proj_dim=256,
     disagreement_type="abs",
     expert_mode="shared_base",
+    branch_depth=2,
 ):
     if expert_mode == "multi_layer":
         ml_expert = MultiLayerExpert(backbone1, pretrained)
@@ -114,5 +117,6 @@ def create_edf(
             num_classes=num_classes,
             disagreement_type=disagreement_type,
             expert_mode="shared_base",
+            branch_depth=branch_depth,
         )
     return model, "head"

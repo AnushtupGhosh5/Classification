@@ -17,6 +17,7 @@ class ConfidenceAwareExpertFusion(BaseExpertFusion):
         fuzzy_lambda=0.1,
         expert_mode="shared_base",
         multi_layer_expert=None,
+        branch_depth=2,
     ):
         super().__init__(
             backbone_name=backbone_name,
@@ -25,6 +26,7 @@ class ConfidenceAwareExpertFusion(BaseExpertFusion):
             num_classes=num_classes,
             expert_mode=expert_mode,
             multi_layer_expert=multi_layer_expert,
+            branch_depth=branch_depth,
         )
         self.confidence_type = confidence_type
         self.fuzzy_lambda = fuzzy_lambda
@@ -172,6 +174,7 @@ def create_caef(
     proj_dim=256,
     confidence_type="scalar",
     expert_mode="shared_base",
+    branch_depth=2,
 ):
     if expert_mode == "multi_layer":
         ml_expert = MultiLayerExpert(backbone1, pretrained)
@@ -192,5 +195,6 @@ def create_caef(
             num_classes=num_classes,
             confidence_type=confidence_type,
             expert_mode="shared_base",
+            branch_depth=branch_depth,
         )
     return model, "head"
