@@ -132,15 +132,18 @@ class BiTemperedLogisticLoss(nn.Module):
         t2: Log temperature.     1.0 = standard log (unbounded loss).
             Typical noise-robust values: 0.2–0.8 (lower = more bounded).
         label_smoothing: Standard label-smoothing factor (0 = off).
+        alpha: Optional per-class weights tensor.
         reduction: 'mean' or 'sum'.
     """
 
-    def __init__(self, t1=0.8, t2=0.4, label_smoothing=0.0, reduction="mean"):
+    def __init__(self, t1=0.8, t2=0.4, label_smoothing=0.0, alpha=None, reduction="mean"):
         super().__init__()
         self.t1 = t1
         self.t2 = t2
         self.label_smoothing = label_smoothing
         self.reduction = reduction
+        if alpha is not None:
+            self.register_buffer("alpha", alpha)
 
     def forward(self, logits, targets):
         if logits.dim() == 2 and logits.size(1) > 1:
@@ -154,11 +157,6 @@ class BiTemperedLogisticLoss(nn.Module):
         # --- tempered softmax (t1) ---
         # softmax_t(x)_i = softmax(x / t1)_i  (equivalent formulation)
         log_probs = F.log_softmax(logits / self.t1, dim=1)
-        # For tempered log-sum-exp of the normaliser we compute the log
-        # partition function at temperature t1, but later apply t2.
-        # A simpler, numerically stable approach:
-        #   1. Compute tempered probabilities p_t1 = softmax(logits / t1)
-        #   2. Apply tempered log with t2 to build the loss
         probs_t1 = torch.exp(log_probs)  # already tempered softmax
 
         # --- label smoothing (in the tempered probability space) ---
@@ -176,16 +174,17 @@ class BiTemperedLogisticLoss(nn.Module):
             )
 
         # --- tempered log (t2) loss per sample ---
-        # L_t2 = sum_j  [ -1/(1-t2) * (q_j^(1-t2) * p_j^(1-t2) - q_j^(1-t2)) ]
-        # which simplifies when targets are one-hot (or smoothed) to:
-        #   L_t2 = sum_j [ q_j * log_t2(p_j) ]
-        # where log_t2(p) = (p^(1-t2) - 1) / (1-t2)
         if self.t2 == 1.0:
             loss_per_sample = -(targets_onehot * torch.log(probs_t1 + 1e-10)).sum(dim=1)
         else:
             # log_t2(p) = (p^(1-t2) - 1) / (1 - t2)
             log_t2_probs = _log_t(probs_t1.clamp(min=1e-10), self.t2)
             loss_per_sample = -(targets_onehot * log_t2_probs).sum(dim=1)
+
+        # Apply class weights if provided
+        if hasattr(self, "alpha"):
+            alpha = self.alpha.to(logits.device)
+            loss_per_sample = alpha[targets] * loss_per_sample
 
         if self.reduction == "mean":
             return loss_per_sample.mean()

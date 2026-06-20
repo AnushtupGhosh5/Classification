@@ -68,6 +68,7 @@ DATASET_REGISTRY = {
         "class_names": ["melanoma", "nevus", "seborrheic_keratosis"],
         "num_classes": 3,
         "has_predefined_splits": True,
+        "original_class_counts": [374, 1372, 254],  # melanoma, nevus, seborrheic_keratosis
         # ISIC17 has a very small, noisy validation set (150 imgs across 3
         # classes). Late in training the model becomes overconfident: correct
         # predictions -> prob ~1 and the inherently-ambiguous samples it can
@@ -97,4 +98,7 @@ def get_dataset_config(name):
     if name not in DATASET_REGISTRY:
         available = ", ".join(DATASET_REGISTRY.keys())
         raise ValueError(f"Unknown dataset '{name}'. Available: {available}")
-    return DATASET_REGISTRY[name]
+    config = DATASET_REGISTRY[name].copy()
+    if "original_class_counts" in config:
+        config["original_class_counts"] = config["original_class_counts"]
+    return config

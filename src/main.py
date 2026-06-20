@@ -273,7 +273,18 @@ def main():
         )
     model = model.to(device)
 
+    # Use original class counts for weight computation (if available)
+    # This is important for datasets like ISIC_17 where the training set is
+    # augmented to balance classes but evaluation reflects real distribution
     class_counts = train_loader.dataset.get_class_counts()
+    if "original_class_counts" in config:
+        # Use original distribution for weight computation
+        original_counts = config["original_class_counts"]
+        class_counts = {i: original_counts[i] for i in range(num_classes)}
+        print(f"Using original class counts for weights: {class_counts}")
+    else:
+        # Fall back to current training set distribution
+        class_counts = train_loader.dataset.get_class_counts()
     total = sum(class_counts.values())
     class_weights = torch.tensor(
         [total / (num_classes * class_counts.get(i, 1)) for i in range(num_classes)],
@@ -290,7 +301,7 @@ def main():
     if loss_type == "focal":
         criterion = FocalLoss(alpha=class_weights, gamma=2.0, label_smoothing=label_smoothing)
     elif loss_type == "bi_tempered":
-        criterion = BiTemperedLogisticLoss(t1=0.8, t2=0.4, label_smoothing=label_smoothing)
+        criterion = BiTemperedLogisticLoss(t1=0.8, t2=0.4, label_smoothing=label_smoothing, alpha=class_weights)
     elif loss_type == "gce":
         criterion = GeneralizedCrossEntropyLoss(q=0.7, label_smoothing=label_smoothing, alpha=class_weights)
     elif loss_type == "sce":
