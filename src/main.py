@@ -30,7 +30,7 @@ from src.models.cef import create_cef
 from src.models.edf import create_edf
 from src.models.caef import create_caef
 from src.models.mief import create_mief
-from src.losses import FocalLoss
+from src.losses import FocalLoss, BiTemperedLogisticLoss, GeneralizedCrossEntropyLoss, SymmetricCrossEntropyLoss
 from src.train import train_model
 from src.evaluate import evaluate_all_splits, run_test_evaluation
 from src.visualize import plot_training_curves
@@ -133,7 +133,7 @@ def save_history_json(history, filepath):
 def main():
     parser = argparse.ArgumentParser(description="Image Classification Pipeline")
     parser.add_argument("--dataset", type=str, required=True,
-                        choices=["all4", "lymphoma", "pbc8", "raabin", "milk10k"],
+                        choices=["all4", "lymphoma", "pbc8", "raabin", "milk10k", "isic17"],
                         help="Dataset to use")
     parser.add_argument("--model", type=str, required=True,
                         choices=list(MODEL_REGISTRY.keys()) + ["dual_fusion"],
@@ -171,9 +171,16 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4,
+                        help="L2 weight decay for optimizer (set 0 to disable)")
+    parser.add_argument("--scheduler", type=str, default="plateau",
+                        choices=["plateau", "cosine"],
+                        help="LR scheduler: plateau (ReduceLROnPlateau) or cosine (CosineAnnealingLR)")
+    parser.add_argument("--label-smoothing", type=float, default=0.1,
+                        help="Label smoothing factor (0 to disable, 0.1 typical)")
     parser.add_argument("--loss", type=str, default="focal",
-                        choices=["focal", "ce"],
-                        help="Loss function: focal or ce (cross-entropy)")
+                        choices=["focal", "ce", "bi_tempered", "gce", "sce"],
+                        help="Loss function: focal, ce, bi_tempered (Bi-Tempered Logistic), gce (Generalized CE), sce (Symmetric CE)")
     parser.add_argument("--freeze-epochs", type=int, default=5,
                         help="Epochs to train with frozen backbone (stage 1)")
     parser.add_argument("--img-size", type=int, default=224)
@@ -189,6 +196,12 @@ def main():
     num_classes = config["num_classes"]
     class_names = config["class_names"]
     has_predefined_splits = config["has_predefined_splits"]
+
+    # Dataset-specific training overrides (e.g. ISIC17 enables EMA / early
+    # stopping / grad clipping to keep the validation loss well-behaved on its
+    # small, noisy validation set). Empty for datasets without overrides, so
+    # their behaviour is unchanged.
+    overrides = config.get("training_overrides", {})
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -267,13 +280,29 @@ def main():
         dtype=torch.float32,
     ).to(device)
 
-    if args.loss == "focal":
-        criterion = FocalLoss(alpha=class_weights, gamma=2.0)
+    # Label smoothing may be overridden per dataset (e.g. ISIC17 bumps it to
+    # cap the overconfidence that drives validation-loss growth).  Similarly
+    # the loss function can be overridden (e.g. ISIC17 uses bi_tempered for
+    # its bounded-loss noise robustness).
+    label_smoothing = overrides.get("label_smoothing", args.label_smoothing)
+    loss_type = overrides.get("loss", args.loss)
+
+    if loss_type == "focal":
+        criterion = FocalLoss(alpha=class_weights, gamma=2.0, label_smoothing=label_smoothing)
+    elif loss_type == "bi_tempered":
+        criterion = BiTemperedLogisticLoss(t1=0.8, t2=0.4, label_smoothing=label_smoothing)
+    elif loss_type == "gce":
+        criterion = GeneralizedCrossEntropyLoss(q=0.7, label_smoothing=label_smoothing, alpha=class_weights)
+    elif loss_type == "sce":
+        criterion = SymmetricCrossEntropyLoss(alpha=1.0, beta=1.0, label_smoothing=label_smoothing, alpha_weight=class_weights)
     else:
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
+        criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
 
     counts_str = ", ".join(f"{class_names[i]}={class_counts.get(i, 0)}" for i in range(num_classes))
     print(f"Class weights: {class_weights.cpu().tolist()} ({counts_str})")
+    if overrides:
+        active = [k for k, v in overrides.items() if v]
+        print(f"Training overrides active: {', '.join(active)} (label_smoothing={label_smoothing})")
 
     attn_suffix = f"_{args.attention}" if args.attention != "none" else ""
     if is_expert_fusion:
@@ -312,6 +341,14 @@ def main():
         save_dir=model_save_dir,
         skip_freeze=is_vit,
         use_amp=args.amp,
+        weight_decay=args.weight_decay,
+        scheduler_type=args.scheduler,
+        early_stopping=overrides.get("early_stopping", False),
+        es_patience=overrides.get("es_patience", 15),
+        es_min_delta=overrides.get("es_min_delta", 0.0),
+        ema=overrides.get("ema", False),
+        ema_decay=overrides.get("ema_decay", 0.999),
+        grad_clip=overrides.get("grad_clip", None),
     )
 
     plot_training_curves(final_metrics["history"], results_dir, model_label)

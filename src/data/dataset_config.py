@@ -47,6 +47,49 @@ DATASET_REGISTRY = {
         "num_classes": 5,
         "has_predefined_splits": True,
     },
+    "milk10k": {
+        "data_dir": os.path.join(
+            _DATA_ROOT,
+            "MILK10k",
+            "MILK10K-split",
+            "kaggle",
+            "working",
+            "MILK10K-split",
+        ),
+        "class_names": [
+            "AKIEC", "BCC", "BEN_OTH", "BKL", "DF", "INF",
+            "MAL_OTH", "MEL", "NV", "SCCKA", "VASC",
+        ],
+        "num_classes": 11,
+        "has_predefined_splits": True,
+    },
+    "isic17": {
+        "data_dir": os.path.join(_DATA_ROOT, "ISIC_17"),
+        "class_names": ["melanoma", "nevus", "seborrheic_keratosis"],
+        "num_classes": 3,
+        "has_predefined_splits": True,
+        # ISIC17 has a very small, noisy validation set (150 imgs across 3
+        # classes). Late in training the model becomes overconfident: correct
+        # predictions -> prob ~1 and the inherently-ambiguous samples it can
+        # never fit -> prob ~0, whose exponentially growing loss dominates the
+        # mean. Reported val loss then rises even as accuracy improves.
+        #
+        # Bi-Tempered Logistic Loss directly addresses this by capping the
+        # maximum per-sample loss (bounded log at t2=0.4), so mislabelled or
+        # genuinely ambiguous samples cannot dominate the average.  EMA smooths
+        # the reported val curve, early stopping halts near the minimum, and
+        # grad clipping stabilises the late high-LR cosine schedule.
+        "training_overrides": {
+            "loss": "bi_tempered",
+            "label_smoothing": 0.15,
+            "ema": True,
+            "ema_decay": 0.999,
+            "early_stopping": True,
+            "es_patience": 15,
+            "es_min_delta": 0.0,
+            "grad_clip": 1.0,
+        },
+    },
 }
 
 

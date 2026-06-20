@@ -3,17 +3,15 @@
 # Test CEF (Competitive Expert Fusion) with shared_base architecture
 python src/main.py \
     --output-dir outputs \
-    --dataset lymphoma \
-    --model cef \
-    --backbone1 mobilenetv3_large \
-    --expert-mode shared_base \
-    --top-k 2 \
+    --dataset isic17 \
+    --model efficientnet_b0 \
+    --scheduler cosine \
     --proj-dim 256 \
-    --branch-depth 2 \
     --epochs 100 \
-    --loss focal \
-    --batch-size 32 \
+    --loss ce \
+    --batch-size 24 \
     --lr 0.0001 \
+    --label-smoothing 0.1 \
     --freeze-epochs 5
 
 # Uncomment to test other fusion methods:
@@ -36,9 +34,9 @@ python src/main.py \
 # CAEF (Confidence Aware Expert Fusion)
 # python src/main.py \
 #     --output-dir outputs \
-#     --dataset milk10k \
+#     --dataset lymphoma \
 #     --model caef \
-#     --backbone1 resnet50 \
+#     --backbone1 efficientnet_b0 \
 #     --expert-mode shared_base \
 #     --confidence-type fuzzy \
 #     --proj-dim 256 \
@@ -48,16 +46,17 @@ python src/main.py \
 #     --lr 0.0001 \
 #     --freeze-epochs 5
 
-# MIEF (Mutual Information Expert Fusion)
+# # MIEF (Mutual Information Expert Fusion)
 # python src/main.py \
 #     --output-dir outputs \
-#     --dataset milk10k \
+#     --dataset isic17 \
+#     --scheduler cosine \
 #     --model mief \
-#     --backbone1 resnet50 \
+#     --backbone1 mobilenetv2 \
 #     --expert-mode shared_base \
 #     --proj-dim 256 \
 #     --epochs 100 \
 #     --loss focal \
-#     --batch-size 32 \
+#     --batch-size 24 \
 #     --lr 0.0001 \
 #     --freeze-epochs 5
