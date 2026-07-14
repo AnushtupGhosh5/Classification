@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from src.data.dataset_config import get_dataset_config
+from src.data.dataset_config import DATASET_REGISTRY, get_dataset_config
 from src.data.dataset import FolderDataset, create_splits
 from src.data.preprocess import get_train_transforms, get_val_transforms
 from src.models.mobilenetv2 import create_mobilenetv2
@@ -64,19 +64,43 @@ ATTENTION_CHOICES = ["none", "se", "cbam", "eca"]
 VIT_MODELS = {"vit_b16", "vit_b32"}
 
 
-def get_data_loaders(data_dir, num_classes, class_names, has_predefined_splits, batch_size, img_size=224, num_workers=4, seed=42):
+def get_data_loaders(
+    data_dir,
+    num_classes,
+    class_names,
+    has_predefined_splits,
+    batch_size,
+    img_size=224,
+    num_workers=4,
+    seed=42,
+    split_dirs=None,
+    train_sample_limit=None,
+    train_sampling_strategy="balanced_random",
+    validate_images=False,
+    fallback_val_from_train=False,
+):
     train_samples, val_samples, test_samples = create_splits(
         data_dir, num_classes, class_names=class_names,
         has_predefined_splits=has_predefined_splits, seed=seed,
+        split_dirs=split_dirs,
+        train_sample_limit=train_sample_limit,
+        train_sampling_strategy=train_sampling_strategy,
+        validate_images=validate_images,
+        fallback_val_from_train=fallback_val_from_train,
     )
 
     train_dataset = FolderDataset(train_samples, transform=get_train_transforms(img_size))
+    train_eval_dataset = FolderDataset(train_samples, transform=get_val_transforms(img_size))
     val_dataset = FolderDataset(val_samples, transform=get_val_transforms(img_size))
     test_dataset = FolderDataset(test_samples, transform=get_val_transforms(img_size))
 
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, pin_memory=True, drop_last=False,
+    )
+    train_eval_loader = DataLoader(
+        train_eval_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
     )
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False,
@@ -87,7 +111,7 @@ def get_data_loaders(data_dir, num_classes, class_names, has_predefined_splits, 
         num_workers=num_workers, pin_memory=True,
     )
 
-    return train_loader, val_loader, test_loader
+    return train_loader, train_eval_loader, val_loader, test_loader
 
 
 CSV_FIELDS = [
@@ -133,7 +157,7 @@ def save_history_json(history, filepath):
 def main():
     parser = argparse.ArgumentParser(description="Image Classification Pipeline")
     parser.add_argument("--dataset", type=str, required=True,
-                        choices=["all4", "lymphoma", "pbc8", "raabin", "milk10k", "isic17"],
+                        choices=list(DATASET_REGISTRY.keys()),
                         help="Dataset to use")
     parser.add_argument("--model", type=str, required=True,
                         choices=list(MODEL_REGISTRY.keys()) + ["dual_fusion"],
@@ -196,6 +220,11 @@ def main():
     num_classes = config["num_classes"]
     class_names = config["class_names"]
     has_predefined_splits = config["has_predefined_splits"]
+    split_dirs = config.get("split_dirs")
+    train_sample_limit = config.get("train_sample_limit")
+    train_sampling_strategy = config.get("train_sampling_strategy", "balanced_random")
+    validate_images = config.get("validate_images", False)
+    fallback_val_from_train = config.get("fallback_val_from_train", False)
 
     # Dataset-specific training overrides (e.g. ISIC17 enables EMA / early
     # stopping / grad clipping to keep the validation loss well-behaved on its
@@ -210,9 +239,18 @@ def main():
 
     print(f"\nDataset: {args.dataset} ({data_dir})")
     print(f"Classes ({num_classes}): {class_names}")
-    train_loader, val_loader, test_loader = get_data_loaders(
+    if train_sample_limit is not None:
+        print(f"Train sampling: limit={train_sample_limit}, strategy={train_sampling_strategy}, seed={args.seed}")
+    if validate_images:
+        print("Image validation: enabled")
+    train_loader, train_eval_loader, val_loader, test_loader = get_data_loaders(
         data_dir, num_classes, class_names, has_predefined_splits,
         args.batch_size, args.img_size, args.num_workers, args.seed,
+        split_dirs=split_dirs,
+        train_sample_limit=train_sample_limit,
+        train_sampling_strategy=train_sampling_strategy,
+        validate_images=validate_images,
+        fallback_val_from_train=fallback_val_from_train,
     )
 
     is_vit = args.model in VIT_MODELS
@@ -273,23 +311,17 @@ def main():
         )
     model = model.to(device)
 
-    # Use original class counts for weight computation (if available)
-    # This is important for datasets like ISIC_17 where the training set is
-    # augmented to balance classes but evaluation reflects real distribution
     class_counts = train_loader.dataset.get_class_counts()
-    if "original_class_counts" in config:
-        # Use original distribution for weight computation
-        original_counts = config["original_class_counts"]
-        class_counts = {i: original_counts[i] for i in range(num_classes)}
-        print(f"Using original class counts for weights: {class_counts}")
-    else:
-        # Fall back to current training set distribution
-        class_counts = train_loader.dataset.get_class_counts()
-    total = sum(class_counts.values())
-    class_weights = torch.tensor(
-        [total / (num_classes * class_counts.get(i, 1)) for i in range(num_classes)],
+    weight_counts = overrides.get("class_weight_counts", config.get("original_class_counts", class_counts))
+    if isinstance(weight_counts, (list, tuple)):
+        weight_counts = {i: count for i, count in enumerate(weight_counts)}
+    total = sum(weight_counts.values())
+    raw_class_weights = torch.tensor(
+        [total / (num_classes * weight_counts.get(i, 1)) for i in range(num_classes)],
         dtype=torch.float32,
-    ).to(device)
+    )
+    class_weight_power = overrides.get("class_weight_power", 1.0)
+    class_weights = raw_class_weights.pow(class_weight_power).to(device)
 
     # Label smoothing may be overridden per dataset (e.g. ISIC17 bumps it to
     # cap the overconfidence that drives validation-loss growth).  Similarly
@@ -310,7 +342,12 @@ def main():
         criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
 
     counts_str = ", ".join(f"{class_names[i]}={class_counts.get(i, 0)}" for i in range(num_classes))
-    print(f"Class weights: {class_weights.cpu().tolist()} ({counts_str})")
+    weight_counts_str = ", ".join(f"{class_names[i]}={weight_counts.get(i, 0)}" for i in range(num_classes))
+    print(f"Train counts: {counts_str}")
+    print(
+        f"Class weights: {class_weights.cpu().tolist()} "
+        f"(from: {weight_counts_str}, power={class_weight_power})"
+    )
     if overrides:
         active = [k for k, v in overrides.items() if v]
         print(f"Training overrides active: {', '.join(active)} (label_smoothing={label_smoothing})")
@@ -370,7 +407,7 @@ def main():
         model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
 
     final_results = evaluate_all_splits(
-        model, train_loader, val_loader, test_loader,
+        model, train_eval_loader, val_loader, test_loader,
         criterion, device, num_classes,
     )
 

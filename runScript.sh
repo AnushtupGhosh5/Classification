@@ -3,13 +3,26 @@
 # Test CEF (Competitive Expert Fusion) with shared_base architecture
 python src/main.py \
     --output-dir outputs \
-    --dataset isic17 \
-    --model efficientnet_b0 \
+    --dataset isic19 \
+    --model efficientnet_b1 \
     --scheduler cosine \
-    --proj-dim 256 \
+    --proj-dim 224 \
     --epochs 100 \
-    --loss ce \
-    --batch-size 24 \
+    --loss focal \
+    --batch-size 16 \
+    --lr 0.0001 \
+    --label-smoothing 0.1 \
+    --freeze-epochs 5
+
+python src/main.py \
+    --output-dir outputs \
+    --dataset isic19 \
+    --model resnet101 \
+    --scheduler cosine \
+    --proj-dim 224 \
+    --epochs 100 \
+    --loss focal \
+    --batch-size 16 \
     --lr 0.0001 \
     --label-smoothing 0.1 \
     --freeze-epochs 5
@@ -17,19 +30,38 @@ python src/main.py \
 # Uncomment to test other fusion methods:
 
 # EDF (Expert Disagreement Fusion)
-# python src/main.py \
-#     --output-dir outputs \
-#     --dataset milk10k \
-#     --model edf \
-#     --backbone1 resnet50 \
-#     --expert-mode shared_base \
-#     --disagreement-type abs \
-#     --proj-dim 256 \
-#     --epochs 100 \
-#     --loss focal \
-#     --batch-size 32 \
-#     --lr 0.0001 \
-#     --freeze-epochs 5
+python src/main.py \
+    --output-dir outputs \
+    --dataset isic19 \
+    --model edf \
+    --scheduler cosine \
+    --backbone1 efficientnet_b1 \
+    --expert-mode multi_layer \
+    --disagreement-type learnable \
+    --proj-dim 224 \
+    --epochs 100 \
+    --loss focal \
+    --batch-size 16 \
+    --lr 0.0001 \
+    --label-smoothing 0.1 \
+    --freeze-epochs 5
+
+    python src/main.py \
+    --output-dir outputs \
+    --dataset isic19 \
+    --model edf \
+    --scheduler cosine \
+    --backbone1 resnet101 \
+    --expert-mode multi_layer \
+    --disagreement-type learnable \
+    --proj-dim 224 \
+    --epochs 100 \
+    --loss focal \
+    --batch-size 16 \
+    --lr 0.0001 \
+    --label-smoothing 0.1 \
+    --freeze-epochs 5
+
 
 # CAEF (Confidence Aware Expert Fusion)
 # python src/main.py \
@@ -49,14 +81,15 @@ python src/main.py \
 # # MIEF (Mutual Information Expert Fusion)
 # python src/main.py \
 #     --output-dir outputs \
-#     --dataset isic17 \
+#     --dataset isic16 \
 #     --scheduler cosine \
 #     --model mief \
-#     --backbone1 mobilenetv2 \
+#     --backbone1 efficientnet_b1 \
 #     --expert-mode shared_base \
 #     --proj-dim 256 \
 #     --epochs 100 \
 #     --loss focal \
-#     --batch-size 24 \
+#     --batch-size 16 \
 #     --lr 0.0001 \
+#     --label-smoothing 0.1 \
 #     --freeze-epochs 5

@@ -11,6 +11,7 @@ from sklearn.metrics import (
     recall_score,
     f1_score,
     confusion_matrix,
+    precision_recall_fscore_support,
 )
 
 
@@ -41,6 +42,28 @@ def compute_metrics(y_true, y_pred, num_classes):
         "f1": round(f1, 4),
         "specificity": round(specificity, 4),
     }
+
+
+def compute_per_class_metrics(y_true, y_pred, num_classes, class_names=None):
+    precision, recall, f1, support = precision_recall_fscore_support(
+        y_true,
+        y_pred,
+        labels=list(range(num_classes)),
+        zero_division=0,
+    )
+    if class_names is None:
+        class_names = [f"class{i}" for i in range(num_classes)]
+
+    rows = []
+    for i, name in enumerate(class_names):
+        rows.append({
+            "class": name,
+            "precision": round(float(precision[i]), 4),
+            "recall": round(float(recall[i]), 4),
+            "f1": round(float(f1[i]), 4),
+            "support": int(support[i]),
+        })
+    return rows
 
 
 @torch.no_grad()

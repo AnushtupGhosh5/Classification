@@ -76,6 +76,8 @@ def plot_roc_auc(y_true, y_probs, num_classes, class_names, save_dir, model_labe
     os.makedirs(save_dir, exist_ok=True)
 
     y_true_bin = label_binarize(y_true, classes=list(range(num_classes)))
+    if num_classes == 2:
+        y_true_bin = np.hstack([1 - y_true_bin, y_true_bin])
 
     fig, ax = plt.subplots(figsize=(10, 8))
     colors = plt.cm.get_cmap("Set1", num_classes)

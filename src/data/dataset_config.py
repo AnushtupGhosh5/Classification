@@ -62,13 +62,24 @@ DATASET_REGISTRY = {
         ],
         "num_classes": 11,
         "has_predefined_splits": True,
+        "training_overrides": {
+            "early_stopping": True,
+            "es_patience": 15,
+            "es_min_delta": 0.0,
+        },
+    },
+    "isic16": {
+        "data_dir": os.path.join(_DATA_ROOT, "ISIC16"),
+        "class_names": ["benign", "malignant"],
+        "num_classes": 2,
+        "has_predefined_splits": True,
     },
     "isic17": {
         "data_dir": os.path.join(_DATA_ROOT, "ISIC_17"),
         "class_names": ["melanoma", "nevus", "seborrheic_keratosis"],
         "num_classes": 3,
         "has_predefined_splits": True,
-        "original_class_counts": [374, 1372, 254],  # melanoma, nevus, seborrheic_keratosis
+        "original_class_counts": [374, 1372, 254],
         # ISIC17 has a very small, noisy validation set (150 imgs across 3
         # classes). Late in training the model becomes overconfident: correct
         # predictions -> prob ~1 and the inherently-ambiguous samples it can
@@ -82,6 +93,14 @@ DATASET_REGISTRY = {
         # grad clipping stabilises the late high-LR cosine schedule.
         "training_overrides": {
             "loss": "bi_tempered",
+            # Original ISIC17 training distribution before offline
+            # augmentation: melanoma=374, nevus=1372, seborrheic_keratosis=254.
+            # Keep original counts available for experiments, but disable
+            # weighting by default. The train folders are already heavily
+            # augmented and nearly balanced, and even sqrt weighting was
+            # forcing minority classes hard enough to hurt test accuracy.
+            "class_weight_counts": [374, 1372, 254],
+            "class_weight_power": 0.0,
             "label_smoothing": 0.15,
             "ema": True,
             "ema_decay": 0.999,
@@ -91,6 +110,40 @@ DATASET_REGISTRY = {
             "grad_clip": 1.0,
         },
     },
+    "isic19": {
+        "data_dir": os.path.join(_DATA_ROOT, "isic19"),
+        "class_names": ["AK", "BCC", "BKL", "DF", "MEL", "NV", "SCC", "VASC"],
+        "num_classes": 8,
+        "has_predefined_splits": True,
+        "split_dirs": {
+            "train": os.path.join(
+                "Train_Validation_dataset",
+                "content",
+                "Train_Validation_dataset",
+                "train",
+            ),
+            "val": os.path.join(
+                "Train_Validation_dataset",
+                "content",
+                "Train_Validation_dataset",
+                "val",
+            ),
+            "test": os.path.join(
+                "Test_dataset",
+                "content",
+                "test_dataset2",
+            ),
+        },
+        "train_sample_limit": 5000,
+        "train_sampling_strategy": "balanced_random",
+        "validate_images": True,
+        "fallback_val_from_train": True,
+        "training_overrides": {
+            "early_stopping": True,
+            "es_patience": 15,
+            "es_min_delta": 0.0,
+        },
+    },
 }
 
 
@@ -98,7 +151,4 @@ def get_dataset_config(name):
     if name not in DATASET_REGISTRY:
         available = ", ".join(DATASET_REGISTRY.keys())
         raise ValueError(f"Unknown dataset '{name}'. Available: {available}")
-    config = DATASET_REGISTRY[name].copy()
-    if "original_class_counts" in config:
-        config["original_class_counts"] = config["original_class_counts"]
-    return config
+    return DATASET_REGISTRY[name]

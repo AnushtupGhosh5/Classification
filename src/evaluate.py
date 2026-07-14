@@ -60,8 +60,9 @@ def run_test_evaluation(model, test_loader, class_names, num_classes, device,
     all_logits = np.array(all_logits)
     all_probs = np.exp(all_logits) / np.exp(all_logits).sum(axis=1, keepdims=True)
 
-    from src.utils import compute_metrics
+    from src.utils import compute_metrics, compute_per_class_metrics
     metrics = compute_metrics(all_labels, all_preds, num_classes)
+    per_class_metrics = compute_per_class_metrics(all_labels, all_preds, num_classes, class_names)
 
     print(f"\n{'='*60}")
     print("TEST RESULTS (Best Model)")
@@ -71,6 +72,13 @@ def run_test_evaluation(model, test_loader, class_names, num_classes, device,
     print(f"  Recall:      {metrics['recall']:.4f}")
     print(f"  F1 Score:    {metrics['f1']:.4f}")
     print(f"  Specificity: {metrics['specificity']:.4f}")
+    print("\n  Per-class:")
+    for row in per_class_metrics:
+        print(
+            f"    {row['class']}: "
+            f"P={row['precision']:.4f} R={row['recall']:.4f} "
+            f"F1={row['f1']:.4f} N={row['support']}"
+        )
 
     plot_confusion_matrix(all_labels, all_preds, class_names, save_dir, model_label)
 
