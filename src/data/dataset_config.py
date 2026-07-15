@@ -1,7 +1,7 @@
 import os
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_DATA_ROOT = os.path.join(_PROJECT_ROOT, "data")
+_DATA_ROOT = os.environ.get("CLASSIFICATION_DATA_ROOT", os.path.join(_PROJECT_ROOT, "data"))
 
 DATASET_REGISTRY = {
     "all4": {
@@ -108,6 +108,23 @@ DATASET_REGISTRY = {
             "es_patience": 15,
             "es_min_delta": 0.0,
             "grad_clip": 1.0,
+        },
+    },
+    "isic18": {
+        "data_dir": os.path.join(_DATA_ROOT, "isic18"),
+        "class_names": ["akiec", "bcc", "bkl", "df", "mel", "nv", "vasc"],
+        "num_classes": 7,
+        "has_predefined_splits": True,
+        "split_dirs": {
+            "train": os.path.join("ham10000_80_20", "ham10000_80_20", "train_dir"),
+            "val": os.path.join("Valid", "kaggle", "working", "Valid"),
+            "test": os.path.join("Test", "kaggle", "working", "Test"),
+        },
+        "validate_images": True,
+        "training_overrides": {
+            "early_stopping": True,
+            "es_patience": 15,
+            "es_min_delta": 0.0,
         },
     },
     "isic19": {

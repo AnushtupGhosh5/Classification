@@ -9,7 +9,7 @@ python src/main.py \
     --proj-dim 224 \
     --epochs 100 \
     --loss focal \
-    --batch-size 16 \
+    --batch-size 8 \
     --lr 0.0001 \
     --label-smoothing 0.1 \
     --freeze-epochs 5
@@ -22,7 +22,7 @@ python src/main.py \
     --proj-dim 224 \
     --epochs 100 \
     --loss focal \
-    --batch-size 16 \
+    --batch-size 8 \
     --lr 0.0001 \
     --label-smoothing 0.1 \
     --freeze-epochs 5
@@ -41,12 +41,12 @@ python src/main.py \
     --proj-dim 224 \
     --epochs 100 \
     --loss focal \
-    --batch-size 16 \
+    --batch-size 8 \
     --lr 0.0001 \
     --label-smoothing 0.1 \
     --freeze-epochs 5
 
-    python src/main.py \
+python src/main.py \
     --output-dir outputs \
     --dataset isic19 \
     --model edf \
@@ -57,10 +57,11 @@ python src/main.py \
     --proj-dim 224 \
     --epochs 100 \
     --loss focal \
-    --batch-size 16 \
+    --batch-size 8 \
     --lr 0.0001 \
     --label-smoothing 0.1 \
     --freeze-epochs 5
+
 
 
 # CAEF (Confidence Aware Expert Fusion)
