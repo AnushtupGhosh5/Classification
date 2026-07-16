@@ -1,50 +1,50 @@
 #!/bin/bash
 
 # Test CEF (Competitive Expert Fusion) with shared_base architecture
-python src/main.py \
-    --output-dir outputs \
-    --dataset isic19 \
-    --model efficientnet_b1 \
-    --scheduler cosine \
-    --proj-dim 224 \
-    --epochs 100 \
-    --loss focal \
-    --batch-size 8 \
-    --lr 0.0001 \
-    --label-smoothing 0.1 \
-    --freeze-epochs 5
+# python src/main.py \
+#     --output-dir outputs \
+#     --dataset isic19 \
+#     --model efficientnet_b1 \
+#     --scheduler cosine \
+#     --proj-dim 224 \
+#     --epochs 100 \
+#     --loss focal \
+#     --batch-size 8 \
+#     --lr 0.0001 \
+#     --label-smoothing 0.1 \
+#     --freeze-epochs 5
 
-python src/main.py \
-    --output-dir outputs \
-    --dataset isic19 \
-    --model resnet101 \
-    --scheduler cosine \
-    --proj-dim 224 \
-    --epochs 100 \
-    --loss focal \
-    --batch-size 8 \
-    --lr 0.0001 \
-    --label-smoothing 0.1 \
-    --freeze-epochs 5
+# python src/main.py \
+#     --output-dir outputs \
+#     --dataset isic19 \
+#     --model resnet101 \
+#     --scheduler cosine \
+#     --proj-dim 224 \
+#     --epochs 100 \
+#     --loss focal \
+#     --batch-size 8 \
+#     --lr 0.0001 \
+#     --label-smoothing 0.1 \
+#     --freeze-epochs 5
 
-# Uncomment to test other fusion methods:
+# # Uncomment to test other fusion methods:
 
-# EDF (Expert Disagreement Fusion)
-python src/main.py \
-    --output-dir outputs \
-    --dataset isic19 \
-    --model edf \
-    --scheduler cosine \
-    --backbone1 efficientnet_b1 \
-    --expert-mode multi_layer \
-    --disagreement-type learnable \
-    --proj-dim 224 \
-    --epochs 100 \
-    --loss focal \
-    --batch-size 8 \
-    --lr 0.0001 \
-    --label-smoothing 0.1 \
-    --freeze-epochs 5
+# # EDF (Expert Disagreement Fusion)
+# python src/main.py \
+#     --output-dir outputs \
+#     --dataset isic19 \
+#     --model edf \
+#     --scheduler cosine \
+#     --backbone1 efficientnet_b1 \
+#     --expert-mode multi_layer \
+#     --disagreement-type learnable \
+#     --proj-dim 224 \
+#     --epochs 100 \
+#     --loss focal \
+#     --batch-size 8 \
+#     --lr 0.0001 \
+#     --label-smoothing 0.1 \
+#     --freeze-epochs 5
 
 python src/main.py \
     --output-dir outputs \
@@ -56,7 +56,7 @@ python src/main.py \
     --disagreement-type learnable \
     --proj-dim 224 \
     --epochs 100 \
-    --loss focal \
+    --loss a \
     --batch-size 8 \
     --lr 0.0001 \
     --label-smoothing 0.1 \
