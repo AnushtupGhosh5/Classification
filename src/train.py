@@ -52,15 +52,21 @@ class EMA:
 class EarlyStopping:
     """Stop training once a monitored quantity stops improving."""
 
-    def __init__(self, patience=15, min_delta=0.0):
+    def __init__(self, patience=15, min_delta=0.0, mode="min"):
         self.patience = patience
         self.min_delta = min_delta
-        self.best = float("inf")
+        self.mode = mode
+        self.best = float("-inf") if mode == "max" else float("inf")
         self.counter = 0
         self.should_stop = False
 
     def step(self, value):
-        if value < self.best - self.min_delta:
+        if self.mode == "max":
+            improved = value > self.best + self.min_delta
+        else:
+            improved = value < self.best - self.min_delta
+
+        if improved:
             self.best = value
             self.counter = 0
         else:
@@ -70,10 +76,23 @@ class EarlyStopping:
         return self.should_stop
 
 
-def _make_scheduler(optimizer, scheduler_type, T_max):
+def _make_scheduler(
+    optimizer,
+    scheduler_type,
+    T_max,
+    monitor_mode="min",
+    scheduler_factor=0.5,
+    scheduler_patience=15,
+):
     if scheduler_type == "cosine":
         return CosineAnnealingLR(optimizer, T_max=T_max, eta_min=1e-7)
-    return ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=15, min_lr=1e-7)
+    return ReduceLROnPlateau(
+        optimizer,
+        mode=monitor_mode,
+        factor=scheduler_factor,
+        patience=scheduler_patience,
+        min_lr=1e-7,
+    )
 
 
 def freeze_backbone(model, head_name):
@@ -99,11 +118,14 @@ def unfreeze_all(model):
 
 
 def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes, scaler=None,
-                    ema=None, grad_clip=None):
+                    ema=None, grad_clip=None, epoch=None, num_epochs=None):
     model.train()
     running_loss = 0.0
     all_preds = []
     all_labels = []
+
+    if hasattr(criterion, "set_epoch") and epoch is not None and num_epochs is not None:
+        criterion.set_epoch(epoch, num_epochs)
 
     for images, labels in tqdm(dataloader, desc="  Training", leave=False):
         images = images.to(device)
@@ -146,7 +168,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes
         all_preds.extend(preds.detach().cpu().numpy())
         all_labels.extend(labels.cpu().numpy())
 
-    avg_loss = running_loss / len(dataloader.dataset) if len(dataloader.dataset) > 0 else 0.0
+    avg_loss = running_loss / len(all_labels) if all_labels else 0.0
     metrics = compute_metrics(all_labels, all_preds, num_classes)
     metrics["loss"] = round(avg_loss, 4)
 
@@ -176,13 +198,14 @@ def _log_epoch(prefix, train_m, val_m, test_m):
 
 def _run_epoch(epoch, num_epochs, stage_label, model, train_loader, val_loader,
                test_loader, criterion, optimizer, device, num_classes, scheduler,
-               history, best_val_loss, save_dir, model_name, scaler=None,
-               ema=None, early_stopping=None, grad_clip=None):
+               history, best_monitor_score, save_dir, model_name, monitor_metric="loss",
+               monitor_mode="min", scaler=None, ema=None, early_stopping=None,
+               grad_clip=None):
     print(f"\nEpoch {epoch}/{num_epochs} [{stage_label}]")
 
     train_metrics = train_one_epoch(
         model, train_loader, criterion, optimizer, device, num_classes,
-        scaler, ema=ema, grad_clip=grad_clip,
+        scaler, ema=ema, grad_clip=grad_clip, epoch=epoch, num_epochs=num_epochs,
     )
 
     # Evaluate with EMA weights swapped in (if enabled) so the reported
@@ -197,8 +220,10 @@ def _run_epoch(epoch, num_epochs, stage_label, model, train_loader, val_loader,
         if ema is not None:
             ema.restore(model)
 
+    monitor_value = val_metrics.get(monitor_metric, val_metrics["loss"])
+
     if isinstance(scheduler, ReduceLROnPlateau):
-        scheduler.step(val_metrics["loss"])
+        scheduler.step(monitor_value)
     else:
         scheduler.step()
 
@@ -208,26 +233,38 @@ def _run_epoch(epoch, num_epochs, stage_label, model, train_loader, val_loader,
 
     _log_epoch(stage_label, train_metrics, val_metrics, test_metrics)
 
-    if val_metrics["loss"] < best_val_loss:
+    improved = (
+        monitor_value > best_monitor_score if monitor_mode == "max"
+        else monitor_value < best_monitor_score
+    )
+    if improved:
         # When EMA is active the averaged weights are currently loaded into
         # the model (restored above), so _save_best writes the EMA snapshot.
         # Without EMA this is just the live model as before.
         if ema is not None:
             ema.apply_shadow(model)
         try:
-            best_val_loss = _save_best(model, save_dir, model_name, val_metrics["loss"], best_val_loss)
+            best_monitor_score = _save_best(
+                model,
+                save_dir,
+                model_name,
+                monitor_value,
+                best_monitor_score,
+            )
         finally:
             if ema is not None:
                 ema.restore(model)
-        print(f"  -> Best model saved (val loss: {best_val_loss:.4f})")
+        print(f"  -> Best model saved ({monitor_metric}: {best_monitor_score:.4f})")
 
     should_stop = False
-    if early_stopping is not None and early_stopping.step(val_metrics["loss"]):
+    if early_stopping is not None and early_stopping.step(monitor_value):
         should_stop = True
-        print(f"  -> Early stopping triggered (no val-loss improvement for "
-              f"{early_stopping.patience} epochs)")
+        print(
+            f"  -> Early stopping triggered (no {monitor_metric} improvement for "
+            f"{early_stopping.patience} epochs)"
+        )
 
-    return best_val_loss, should_stop
+    return best_monitor_score, should_stop
 
 
 def train_model(
@@ -248,6 +285,10 @@ def train_model(
     use_amp=False,
     weight_decay=0.0,
     scheduler_type="plateau",
+    monitor_metric="loss",
+    monitor_mode="min",
+    scheduler_factor=0.5,
+    scheduler_patience=15,
     early_stopping=False,
     es_patience=15,
     es_min_delta=0.0,
@@ -257,7 +298,7 @@ def train_model(
 ):
     os.makedirs(save_dir, exist_ok=True)
 
-    best_val_loss = float("inf")
+    best_val_loss = float("-inf") if monitor_mode == "max" else float("inf")
     history = {
         "train": [],
         "val": [],
@@ -268,7 +309,7 @@ def train_model(
     # and fine-tune stages. Frozen parameters are simply tracked unchanged by
     # the shadow until stage 2.
     ema_state = EMA(model, decay=ema_decay) if ema else None
-    stopper = EarlyStopping(patience=es_patience, min_delta=es_min_delta) if early_stopping else None
+    stopper = EarlyStopping(patience=es_patience, min_delta=es_min_delta, mode=monitor_mode) if early_stopping else None
 
     scaler = torch.amp.GradScaler("cuda") if (use_amp and device.type == "cuda") else None
 
@@ -284,22 +325,33 @@ def train_model(
     if ema_state is not None:
         print(f"EMA: enabled (decay={ema_decay})")
     if stopper is not None:
-        print(f"Early stopping: enabled (patience={es_patience}, min_delta={es_min_delta})")
+        print(
+            f"Early stopping: enabled (monitor={monitor_metric}, mode={monitor_mode}, "
+            f"patience={es_patience}, min_delta={es_min_delta})"
+        )
     if grad_clip is not None:
         print(f"Gradient clipping: max_norm={grad_clip}")
     print(f"{'='*60}")
 
-    if skip_freeze:
+    if skip_freeze or freeze_epochs <= 0:
         unfreeze_all(model)
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-        scheduler = _make_scheduler(optimizer, scheduler_type, T_max=num_epochs)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        scheduler = _make_scheduler(
+            optimizer,
+            scheduler_type,
+            T_max=num_epochs,
+            monitor_mode=monitor_mode,
+            scheduler_factor=scheduler_factor,
+            scheduler_patience=scheduler_patience,
+        )
 
         for epoch in range(1, num_epochs + 1):
             best_val_loss, should_stop = _run_epoch(
                 epoch, num_epochs, "Full Fine-tune", model, train_loader,
                 val_loader, test_loader, criterion, optimizer, device,
                 num_classes, scheduler, history, best_val_loss, save_dir,
-                model_name, scaler, ema=ema_state, early_stopping=stopper,
+                model_name, monitor_metric=monitor_metric, monitor_mode=monitor_mode,
+                scaler=scaler, ema=ema_state, early_stopping=stopper,
                 grad_clip=grad_clip,
             )
             if should_stop:
@@ -311,15 +363,23 @@ def train_model(
             # For expert fusion: backbone frozen but branches/fusion/head trainable
             # For regular models: only head is trainable
             trainable = [p for p in model.parameters() if p.requires_grad]
-            stage1_optimizer = torch.optim.Adam(trainable, lr=lr, weight_decay=weight_decay)
-            stage1_scheduler = _make_scheduler(stage1_optimizer, scheduler_type, T_max=freeze_epochs)
+            stage1_optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=weight_decay)
+            stage1_scheduler = _make_scheduler(
+                stage1_optimizer,
+                scheduler_type,
+                T_max=freeze_epochs,
+                monitor_mode=monitor_mode,
+                scheduler_factor=scheduler_factor,
+                scheduler_patience=scheduler_patience,
+            )
 
             for epoch in range(1, freeze_epochs + 1):
                 best_val_loss, should_stop = _run_epoch(
                     epoch, num_epochs, "Stage 1 - Frozen", model, train_loader,
                     val_loader, test_loader, criterion, stage1_optimizer, device,
                     num_classes, stage1_scheduler, history, best_val_loss,
-                    save_dir, model_name, scaler, ema=ema_state,
+                    save_dir, model_name, monitor_metric=monitor_metric,
+                    monitor_mode=monitor_mode, scaler=scaler, ema=ema_state,
                     early_stopping=stopper, grad_clip=grad_clip,
                 )
                 if should_stop:
@@ -345,7 +405,7 @@ def train_model(
                     p for p in model.parameters()
                     if id(p) not in backbone_param_ids and id(p) not in head_param_ids
                 ]
-                stage2_optimizer = torch.optim.Adam([
+                stage2_optimizer = torch.optim.AdamW([
                     {"params": backbone_params, "lr": lr / 10, "weight_decay": weight_decay},
                     {"params": middle_params, "lr": lr / 5, "weight_decay": weight_decay},
                     {"params": head_params_list, "lr": lr, "weight_decay": weight_decay},
@@ -355,18 +415,26 @@ def train_model(
                 backbone_params = [
                     p for p in model.parameters() if id(p) not in head_param_ids
                 ]
-                stage2_optimizer = torch.optim.Adam([
+                stage2_optimizer = torch.optim.AdamW([
                     {"params": backbone_params, "lr": lr / 10, "weight_decay": weight_decay},
                     {"params": head_params_list, "lr": lr, "weight_decay": weight_decay},
                 ])
-            scheduler = _make_scheduler(stage2_optimizer, scheduler_type, T_max=stage2_epochs)
+            scheduler = _make_scheduler(
+                stage2_optimizer,
+                scheduler_type,
+                T_max=stage2_epochs,
+                monitor_mode=monitor_mode,
+                scheduler_factor=scheduler_factor,
+                scheduler_patience=scheduler_patience,
+            )
 
             for epoch in range(freeze_epochs + 1, num_epochs + 1):
                 best_val_loss, should_stop = _run_epoch(
                     epoch, num_epochs, "Stage 2 - Fine-tune", model, train_loader,
                     val_loader, test_loader, criterion, stage2_optimizer, device,
                     num_classes, scheduler, history, best_val_loss, save_dir,
-                    model_name, scaler, ema=ema_state, early_stopping=stopper,
+                    model_name, monitor_metric=monitor_metric, monitor_mode=monitor_mode,
+                    scaler=scaler, ema=ema_state, early_stopping=stopper,
                     grad_clip=grad_clip,
                 )
                 if should_stop:

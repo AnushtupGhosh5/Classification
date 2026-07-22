@@ -68,6 +68,58 @@ class FocalLoss(nn.Module):
         return loss
 
 
+class SEEFNetCEFocalLoss(nn.Module):
+    """Cross-entropy plus a decaying focal component from the SEEFNet notebooks."""
+
+    def __init__(self, alpha=None, gamma=2.0, initial_focal_weight=0.9,
+                 label_smoothing=0.0, reduction="mean"):
+        super().__init__()
+        self.gamma = gamma
+        self.initial_focal_weight = initial_focal_weight
+        self.label_smoothing = label_smoothing
+        self.reduction = reduction
+        self.focal_weight = initial_focal_weight
+        if alpha is not None:
+            self.register_buffer("alpha", alpha)
+
+    def set_epoch(self, epoch, num_epochs):
+        if num_epochs <= 1:
+            self.focal_weight = 0.0
+            return
+        decay_factor = min(max((epoch - 1) / (num_epochs - 1), 0.0), 1.0)
+        self.focal_weight = self.initial_focal_weight * (1.0 - decay_factor)
+
+    def forward(self, logits, targets):
+        targets = targets.long()
+        log_probs = F.log_softmax(logits, dim=1)
+        probs = torch.exp(log_probs)
+        pt = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+
+        if self.label_smoothing > 0:
+            nll = -log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+            smooth = -log_probs.mean(dim=1)
+            ce = (1 - self.label_smoothing) * nll + self.label_smoothing * smooth
+        else:
+            ce = F.nll_loss(log_probs, targets, reduction="none")
+
+        focal = ((1 - pt) ** self.gamma) * ce
+        if hasattr(self, "alpha"):
+            alpha = self.alpha.to(logits.device)
+            weights = alpha[targets]
+            ce = weights * ce
+            focal = weights * focal
+
+        focal_weight = self.focal_weight
+        ce_weight = 1.0 - focal_weight
+        loss = ce_weight * ce + focal_weight * focal
+
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+
 class WeightedBCEWithLogitsLoss(nn.Module):
     def __init__(self, class_weights=None):
         super().__init__()

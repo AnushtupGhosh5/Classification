@@ -30,7 +30,13 @@ from src.models.cef import create_cef
 from src.models.edf import create_edf
 from src.models.caef import create_caef
 from src.models.mief import create_mief
-from src.losses import FocalLoss, BiTemperedLogisticLoss, GeneralizedCrossEntropyLoss, SymmetricCrossEntropyLoss
+from src.losses import (
+    FocalLoss,
+    SEEFNetCEFocalLoss,
+    BiTemperedLogisticLoss,
+    GeneralizedCrossEntropyLoss,
+    SymmetricCrossEntropyLoss,
+)
 from src.train import train_model
 from src.evaluate import evaluate_all_splits, run_test_evaluation
 from src.visualize import plot_training_curves
@@ -78,6 +84,9 @@ def get_data_loaders(
     train_sampling_strategy="balanced_random",
     validate_images=False,
     fallback_val_from_train=False,
+    use_weighted_sampler=False,
+    sampler_mode="equal",
+    augment_style="balanced",
 ):
     train_samples, val_samples, test_samples = create_splits(
         data_dir, num_classes, class_names=class_names,
@@ -89,15 +98,72 @@ def get_data_loaders(
         fallback_val_from_train=fallback_val_from_train,
     )
 
-    train_dataset = FolderDataset(train_samples, transform=get_train_transforms(img_size))
-    train_eval_dataset = FolderDataset(train_samples, transform=get_val_transforms(img_size))
-    val_dataset = FolderDataset(val_samples, transform=get_val_transforms(img_size))
-    test_dataset = FolderDataset(test_samples, transform=get_val_transforms(img_size))
-
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True, drop_last=False,
+    train_dataset = FolderDataset(
+        train_samples,
+        transform=get_train_transforms(img_size, augment_style=augment_style),
     )
+    train_eval_dataset = FolderDataset(
+        train_samples,
+        transform=get_val_transforms(img_size, augment_style=augment_style),
+    )
+    val_dataset = FolderDataset(
+        val_samples,
+        transform=get_val_transforms(img_size, augment_style=augment_style),
+    )
+    test_dataset = FolderDataset(
+        test_samples,
+        transform=get_val_transforms(img_size, augment_style=augment_style),
+    )
+
+    # WeightedRandomSampler: gives every class equal draw probability so that
+    # the model sees a balanced view of all classes each epoch, replicating what
+    # SEEFNet does via offline augmented datasets.
+    #
+    # sampler_mode='equal'  — weight = 1/count.  Every class is drawn ~max_count
+    #   times per epoch. Best for small datasets (e.g. ISIC16 4:1 ratio).
+    # sampler_mode='sqrt'   — weight = 1/sqrt(count).  Gentler rebalancing;
+    #   epoch size stays close to the original.  Best for large, severely
+    #   imbalanced datasets (e.g. HAM10K 58:1 ratio) where 'equal' would
+    #   produce an epoch 4–5x larger than the real data.
+    if use_weighted_sampler:
+        import math
+        from torch.utils.data import WeightedRandomSampler
+        class_counts = train_dataset.get_class_counts()
+        if sampler_mode == "sqrt":
+            raw_weights = {c: 1.0 / math.sqrt(n) for c, n in class_counts.items()}
+            total_weight = sum(raw_weights.values())
+            norm_weights = {c: w / total_weight for c, w in raw_weights.items()}
+            sample_weights = [norm_weights[label] for _, label in train_samples]
+            # Keep epoch size = original dataset size (samples are redistributed, not added)
+            num_samples = len(train_samples)
+            mode_desc = "sqrt-weighted"
+        else:  # 'equal'
+            raw_weights = {c: 1.0 / n for c, n in class_counts.items()}
+            sample_weights = [raw_weights[label] for _, label in train_samples]
+            # Each class gets ~max_count draws per epoch
+            max_count = max(class_counts.values())
+            num_samples = num_classes * max_count
+            mode_desc = "equal"
+
+        sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=num_samples,
+            replacement=True,
+        )
+        print(
+            f"  WeightedRandomSampler ({mode_desc}): {num_samples} samples/epoch "
+            f"(original: {len(train_samples)})"
+        )
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, sampler=sampler,
+            num_workers=num_workers, pin_memory=True, drop_last=False,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True,
+            num_workers=num_workers, pin_memory=True, drop_last=False,
+        )
+
     train_eval_loader = DataLoader(
         train_eval_dataset, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=True,
@@ -203,8 +269,8 @@ def main():
     parser.add_argument("--label-smoothing", type=float, default=0.1,
                         help="Label smoothing factor (0 to disable, 0.1 typical)")
     parser.add_argument("--loss", type=str, default="focal",
-                        choices=["focal", "ce", "bi_tempered", "gce", "sce"],
-                        help="Loss function: focal, ce, bi_tempered (Bi-Tempered Logistic), gce (Generalized CE), sce (Symmetric CE)")
+                        choices=["focal", "ce_focal", "ce", "bi_tempered", "gce", "sce"],
+                        help="Loss function: focal, ce_focal (SEEFNet CE+decaying focal), ce, bi_tempered, gce, sce")
     parser.add_argument("--freeze-epochs", type=int, default=5,
                         help="Epochs to train with frozen backbone (stage 1)")
     parser.add_argument("--img-size", type=int, default=224)
@@ -232,6 +298,21 @@ def main():
     # their behaviour is unchanged.
     overrides = config.get("training_overrides", {})
 
+    supplied_options = set()
+    for token in sys.argv[1:]:
+        if token.startswith("--"):
+            supplied_options.add(token.split("=", 1)[0])
+
+    def override_default(arg_name, override_key=None):
+        override_key = override_key or arg_name
+        option_name = f"--{arg_name.replace('_', '-')}"
+        arg_value = getattr(args, arg_name)
+        if option_name in supplied_options:
+            return arg_value
+        if arg_value == parser.get_default(arg_name):
+            return overrides.get(override_key, arg_value)
+        return arg_value
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     if torch.cuda.is_available():
@@ -243,20 +324,36 @@ def main():
         print(f"Train sampling: limit={train_sample_limit}, strategy={train_sampling_strategy}, seed={args.seed}")
     if validate_images:
         print("Image validation: enabled")
+    use_weighted_sampler = overrides.get("use_weighted_sampler", False)
+    sampler_mode = overrides.get("sampler_mode", "equal")
+    if use_weighted_sampler:
+        print(f"Oversampling: WeightedRandomSampler enabled (mode={sampler_mode})")
+    augment_style = overrides.get("augment_style", "balanced")
+    print(f"Train augmentation: {augment_style}")
+    img_size = override_default("img_size")
+    if img_size != args.img_size:
+        print(f"Dataset input size override: {img_size}")
     train_loader, train_eval_loader, val_loader, test_loader = get_data_loaders(
         data_dir, num_classes, class_names, has_predefined_splits,
-        args.batch_size, args.img_size, args.num_workers, args.seed,
+        args.batch_size, img_size, args.num_workers, args.seed,
         split_dirs=split_dirs,
         train_sample_limit=train_sample_limit,
         train_sampling_strategy=train_sampling_strategy,
         validate_images=validate_images,
         fallback_val_from_train=fallback_val_from_train,
+        use_weighted_sampler=use_weighted_sampler,
+        sampler_mode=sampler_mode,
+        augment_style=augment_style,
     )
 
     is_vit = args.model in VIT_MODELS
     is_dual_fusion = args.model == "dual_fusion"
     is_expert_fusion = args.model in ("cef", "edf", "caef", "mief")
-    print(f"\nModel: {args.model} | Attention: {args.attention} | Loss: {args.loss} | Batch: {args.batch_size} | Epochs: {args.epochs} | LR: {args.lr}")
+    print(
+        f"\nModel: {args.model} | Attention: {args.attention} | "
+        f"Batch: {args.batch_size} | Epochs: {args.epochs} | "
+        f"Image size: {img_size}"
+    )
     if is_expert_fusion:
         if args.expert_mode == "multi_layer":
             print(f"Expert mode: multi_layer | Backbone: {args.backbone1}")
@@ -327,11 +424,18 @@ def main():
     # cap the overconfidence that drives validation-loss growth).  Similarly
     # the loss function can be overridden (e.g. ISIC17 uses bi_tempered for
     # its bounded-loss noise robustness).
-    label_smoothing = overrides.get("label_smoothing", args.label_smoothing)
-    loss_type = overrides.get("loss", args.loss)
+    label_smoothing = override_default("label_smoothing")
+    loss_type = override_default("loss")
 
     if loss_type == "focal":
         criterion = FocalLoss(alpha=class_weights, gamma=2.0, label_smoothing=label_smoothing)
+    elif loss_type == "ce_focal":
+        criterion = SEEFNetCEFocalLoss(
+            alpha=class_weights,
+            gamma=2.0,
+            initial_focal_weight=overrides.get("initial_focal_weight", 0.9),
+            label_smoothing=label_smoothing,
+        )
     elif loss_type == "bi_tempered":
         criterion = BiTemperedLogisticLoss(t1=0.8, t2=0.4, label_smoothing=label_smoothing, alpha=class_weights)
     elif loss_type == "gce":
@@ -373,6 +477,21 @@ def main():
     results_dir = os.path.join(args.output_dir, "results", args.dataset)
     results_csv = os.path.join(results_dir, "results.csv")
 
+    train_lr = override_default("lr")
+    train_weight_decay = override_default("weight_decay")
+    train_scheduler = override_default("scheduler")
+    train_freeze_epochs = override_default("freeze_epochs")
+    monitor_metric = overrides.get("monitor_metric", "loss")
+    monitor_mode = overrides.get("monitor_mode", "min")
+    scheduler_factor = overrides.get("scheduler_factor", 0.5)
+    scheduler_patience = overrides.get("scheduler_patience", 15)
+    print(
+        f"Effective training: lr={train_lr} | weight_decay={train_weight_decay} | "
+        f"scheduler={train_scheduler} | loss={loss_type} | "
+        f"label_smoothing={label_smoothing} | image_size={img_size} | "
+        f"monitor={monitor_metric}/{monitor_mode} | freeze_epochs={train_freeze_epochs}"
+    )
+
     final_metrics = train_model(
         model=model,
         head_name=head_name,
@@ -380,17 +499,21 @@ def main():
         val_loader=val_loader,
         test_loader=test_loader,
         criterion=criterion,
-        lr=args.lr,
+        lr=train_lr,
         device=device,
         num_classes=num_classes,
         num_epochs=args.epochs,
-        freeze_epochs=args.freeze_epochs,
+        freeze_epochs=train_freeze_epochs,
         model_name=model_label,
         save_dir=model_save_dir,
         skip_freeze=is_vit,
         use_amp=args.amp,
-        weight_decay=args.weight_decay,
-        scheduler_type=args.scheduler,
+        weight_decay=train_weight_decay,
+        scheduler_type=train_scheduler,
+        monitor_metric=monitor_metric,
+        monitor_mode=monitor_mode,
+        scheduler_factor=scheduler_factor,
+        scheduler_patience=scheduler_patience,
         early_stopping=overrides.get("early_stopping", False),
         es_patience=overrides.get("es_patience", 15),
         es_min_delta=overrides.get("es_min_delta", 0.0),
@@ -425,12 +548,12 @@ def main():
         final_results, results_csv,
         model_label if is_dual_fusion else args.model,
         args.dataset, args.attention,
-        args.batch_size, args.epochs, args.lr,
+        args.batch_size, args.epochs, train_lr,
     )
 
     history_path = os.path.join(
         args.output_dir, "results", args.dataset,
-        f"{model_label}_bs{args.batch_size}_ep{args.epochs}_lr{args.lr}_history.json",
+        f"{model_label}_bs{args.batch_size}_ep{args.epochs}_lr{train_lr}_history.json",
     )
     save_history_json(final_metrics["history"], history_path)
 
