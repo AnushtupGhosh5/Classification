@@ -63,15 +63,25 @@ DATASET_REGISTRY = {
         "num_classes": 11,
         "has_predefined_splits": True,
         "training_overrides": {
-            "augment_style": "seefnet",
+            # MILK10K mixes clinical and dermoscopic images.  The old SEEFNet
+            # affine recipe can translate a small lesion out of view and adds
+            # black/sheared borders never present at evaluation.  Preserve
+            # aspect ratio and use only lesion-safe perturbations instead.
+            "augment_style": "skin_focus",
+            # Full inverse-frequency CE gave MAL_OTH (12 train images) around
+            # 55x the BCC weight.  Sqrt sampling plus quarter-power CE keeps
+            # rare labels visible without letting repeated examples dominate.
+            "use_weighted_sampler": True,
+            "sampler_mode": "sqrt",
+            "class_weight_power": 0.25,
             "freeze_epochs": 0,
             "scheduler": "cosine",
-            "monitor_metric": "accuracy",
-            "monitor_mode": "max",
             "loss": "ce",
             "label_smoothing": 0.05,
             "lr": 3e-4,
             "weight_decay": 1e-4,
+            "ema": True,
+            "ema_decay": 0.999,
             "early_stopping": True,
             "es_patience": 12,
             "es_min_delta": 0.0,
@@ -87,11 +97,13 @@ DATASET_REGISTRY = {
         "training_overrides": {
             "augment_style": "skin",
             "use_weighted_sampler": True,
+            # Equal oversampling repeats each malignant image roughly four
+            # times per epoch. Sqrt sampling is a gentler ~2:1 correction and
+            # keeps the epoch at the original 719-image size.
+            "sampler_mode": "sqrt",
             "class_weight_power": 0.0,
             "freeze_epochs": 0,
             "scheduler": "cosine",
-            "monitor_metric": "accuracy",
-            "monitor_mode": "max",
             "loss": "ce",
             "label_smoothing": 0.05,
             "lr": 3e-4,
@@ -102,6 +114,7 @@ DATASET_REGISTRY = {
             "early_stopping": True,
             "es_patience": 12,
             "es_min_delta": 0.0,
+            "tta": True,
         },
     },
     "isic17": {
@@ -152,23 +165,21 @@ DATASET_REGISTRY = {
         },
         "validate_images": True,
         "training_overrides": {
-            "augment_style": "skin",
+            "augment_style": "skin_focus",
             "use_weighted_sampler": True,
             "sampler_mode": "sqrt",
             "class_weight_power": 0.0,
             "freeze_epochs": 0,
             "scheduler": "cosine",
-            "monitor_metric": "accuracy",
-            "monitor_mode": "max",
             "loss": "ce",
             "label_smoothing": 0.05,
-            "lr": 3e-4,
-            "weight_decay": 1e-4,
-            "img_size": 256,
+            "lr": 1e-4,
+            "weight_decay": 5e-5,
+            "img_size": 384,
             "ema": True,
-            "ema_decay": 0.995,
+            "ema_decay": 0.999,
             "early_stopping": True,
-            "es_patience": 12,
+            "es_patience": 15,
             "es_min_delta": 0.0,
         },
     },

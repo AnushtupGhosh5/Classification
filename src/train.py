@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
 from tqdm import tqdm
 from src.utils import evaluate_model, compute_metrics
@@ -118,11 +119,16 @@ def unfreeze_all(model):
 
 
 def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes, scaler=None,
-                    ema=None, grad_clip=None, epoch=None, num_epochs=None):
+                    ema=None, grad_clip=None, epoch=None, num_epochs=None,
+                    mixup_alpha=0.0, cutmix_alpha=0.0, mix_prob=0.0,
+                    train_scales=None):
     model.train()
     running_loss = 0.0
     all_preds = []
     all_labels = []
+    router_weight_sum = None
+    router_entropy_sum = 0.0
+    router_sample_count = 0
 
     if hasattr(criterion, "set_epoch") and epoch is not None and num_epochs is not None:
         criterion.set_epoch(epoch, num_epochs)
@@ -130,6 +136,51 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes
     for images, labels in tqdm(dataloader, desc="  Training", leave=False):
         images = images.to(device)
         labels = labels.to(device)
+        if train_scales:
+            scale_index = torch.randint(len(train_scales), (1,)).item()
+            target_size = train_scales[scale_index]
+            if images.shape[-2:] != (target_size, target_size):
+                images = F.interpolate(
+                    images,
+                    size=(target_size, target_size),
+                    mode="bilinear",
+                    align_corners=False,
+                    antialias=True,
+                )
+
+        labels_a, labels_b, lam = labels, labels, 1.0
+        if mix_prob > 0 and torch.rand(1).item() < mix_prob and images.size(0) > 1:
+            permutation = torch.randperm(images.size(0), device=device)
+            labels_b = labels[permutation]
+            use_cutmix = cutmix_alpha > 0 and (mixup_alpha <= 0 or torch.rand(1).item() < 0.5)
+            alpha = cutmix_alpha if use_cutmix else mixup_alpha
+            lam = torch.distributions.Beta(alpha, alpha).sample().item()
+            if use_cutmix:
+                height, width = images.shape[-2:]
+                cut_ratio = (1.0 - lam) ** 0.5
+                cut_w, cut_h = int(width * cut_ratio), int(height * cut_ratio)
+                center_x = torch.randint(width, (1,)).item()
+                center_y = torch.randint(height, (1,)).item()
+                x1, x2 = max(center_x - cut_w // 2, 0), min(center_x + cut_w // 2, width)
+                y1, y2 = max(center_y - cut_h // 2, 0), min(center_y + cut_h // 2, height)
+                images[:, :, y1:y2, x1:x2] = images[permutation, :, y1:y2, x1:x2]
+                lam = 1.0 - ((x2 - x1) * (y2 - y1) / (width * height))
+            else:
+                images = lam * images + (1.0 - lam) * images[permutation]
+
+        def mixed_loss(outputs):
+            return lam * criterion(outputs, labels_a) + (1.0 - lam) * criterion(outputs, labels_b)
+
+        def expert_auxiliary_loss(result):
+            expert_logits = result.get("expert_logits")
+            weight = getattr(model, "expert_loss_weight", 0.0)
+            if expert_logits is None or weight <= 0:
+                return 0.0
+            losses = [
+                mixed_loss(expert_logits[:, index])
+                for index in range(expert_logits.size(1))
+            ]
+            return weight * torch.stack(losses).mean()
 
         optimizer.zero_grad()
         if scaler is not None:
@@ -137,10 +188,14 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes
                 result = model(images)
                 if isinstance(result, dict):
                     outputs = result["logits"]
-                    loss = criterion(outputs, labels) + result.get("aux_loss", 0.0)
+                    loss = (
+                        mixed_loss(outputs)
+                        + expert_auxiliary_loss(result)
+                        + result.get("aux_loss", 0.0)
+                    )
                 else:
                     outputs = result
-                    loss = criterion(outputs, labels)
+                    loss = mixed_loss(outputs)
             scaler.scale(loss).backward()
             if grad_clip is not None:
                 scaler.unscale_(optimizer)
@@ -151,10 +206,14 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes
             result = model(images)
             if isinstance(result, dict):
                 outputs = result["logits"]
-                loss = criterion(outputs, labels) + result.get("aux_loss", 0.0)
+                loss = (
+                    mixed_loss(outputs)
+                    + expert_auxiliary_loss(result)
+                    + result.get("aux_loss", 0.0)
+                )
             else:
                 outputs = result
-                loss = criterion(outputs, labels)
+                loss = mixed_loss(outputs)
             loss.backward()
             if grad_clip is not None:
                 nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -162,6 +221,19 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes
 
         if ema is not None:
             ema.update(model)
+
+        if isinstance(result, dict) and result.get("router_weights") is not None:
+            router_weights = result["router_weights"].detach().float()
+            batch_weight_sum = router_weights.sum(dim=0).cpu()
+            router_weight_sum = (
+                batch_weight_sum if router_weight_sum is None
+                else router_weight_sum + batch_weight_sum
+            )
+            router_entropy_sum += float(
+                (-(router_weights * router_weights.clamp_min(1e-8).log()).sum(dim=1))
+                .sum().cpu()
+            )
+            router_sample_count += router_weights.size(0)
 
         running_loss += loss.item() * images.size(0)
         preds = outputs.argmax(dim=1)
@@ -171,6 +243,13 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes
     avg_loss = running_loss / len(all_labels) if all_labels else 0.0
     metrics = compute_metrics(all_labels, all_preds, num_classes)
     metrics["loss"] = round(avg_loss, 4)
+    if router_sample_count:
+        mean_weights = router_weight_sum / router_sample_count
+        for index, weight in enumerate(mean_weights.tolist()):
+            metrics[f"router_expert{index}"] = round(weight, 4)
+        metrics["router_entropy"] = round(
+            router_entropy_sum / router_sample_count, 4
+        )
 
     return metrics
 
@@ -200,12 +279,15 @@ def _run_epoch(epoch, num_epochs, stage_label, model, train_loader, val_loader,
                test_loader, criterion, optimizer, device, num_classes, scheduler,
                history, best_monitor_score, save_dir, model_name, monitor_metric="loss",
                monitor_mode="min", scaler=None, ema=None, early_stopping=None,
-               grad_clip=None):
+               grad_clip=None, mixup_alpha=0.0, cutmix_alpha=0.0, mix_prob=0.0,
+               eval_tta=False, train_scales=None):
     print(f"\nEpoch {epoch}/{num_epochs} [{stage_label}]")
 
     train_metrics = train_one_epoch(
         model, train_loader, criterion, optimizer, device, num_classes,
         scaler, ema=ema, grad_clip=grad_clip, epoch=epoch, num_epochs=num_epochs,
+        mixup_alpha=mixup_alpha, cutmix_alpha=cutmix_alpha, mix_prob=mix_prob,
+        train_scales=train_scales,
     )
 
     # Evaluate with EMA weights swapped in (if enabled) so the reported
@@ -214,8 +296,12 @@ def _run_epoch(epoch, num_epochs, stage_label, model, train_loader, val_loader,
     if ema is not None:
         ema.apply_shadow(model)
     try:
-        val_metrics, _ = evaluate_model(model, val_loader, criterion, device, num_classes)
-        test_metrics, _ = evaluate_model(model, test_loader, criterion, device, num_classes)
+        val_metrics, _ = evaluate_model(
+            model, val_loader, criterion, device, num_classes, tta=eval_tta,
+        )
+        # The official test set is intentionally not inspected during training.
+        # It is evaluated once after selecting the checkpoint on validation loss.
+        test_metrics = None
     finally:
         if ema is not None:
             ema.restore(model)
@@ -229,9 +315,37 @@ def _run_epoch(epoch, num_epochs, stage_label, model, train_loader, val_loader,
 
     history["train"].append({"epoch": epoch, **train_metrics})
     history["val"].append({"epoch": epoch, **val_metrics})
-    history["test"].append({"epoch": epoch, **test_metrics})
 
-    _log_epoch(stage_label, train_metrics, val_metrics, test_metrics)
+    print(
+        f"  Train - Loss: {train_metrics['loss']:.4f} | "
+        f"Acc: {train_metrics['accuracy']:.4f} | F1: {train_metrics['f1']:.4f}"
+    )
+    if "router_entropy" in train_metrics:
+        router_keys = sorted(
+            (key for key in train_metrics if key.startswith("router_expert")),
+            key=lambda key: int(key.removeprefix("router_expert")),
+        )
+        usage = ", ".join(
+            f"{train_metrics[key]:.3f}" for key in router_keys
+        )
+        print(
+            f"          Router usage: [{usage}] | "
+            f"Entropy: {train_metrics['router_entropy']:.3f}"
+        )
+    print(
+        f"  Val   - Loss: {val_metrics['loss']:.4f} | "
+        f"Acc: {val_metrics['accuracy']:.4f} | F1: {val_metrics['f1']:.4f}"
+    )
+    if "router_entropy" in val_metrics:
+        router_keys = sorted(
+            (key for key in val_metrics if key.startswith("router_expert")),
+            key=lambda key: int(key.removeprefix("router_expert")),
+        )
+        usage = ", ".join(f"{val_metrics[key]:.3f}" for key in router_keys)
+        print(
+            f"          Val router: [{usage}] | "
+            f"Entropy: {val_metrics['router_entropy']:.3f}"
+        )
 
     improved = (
         monitor_value > best_monitor_score if monitor_mode == "max"
@@ -295,6 +409,11 @@ def train_model(
     ema=False,
     ema_decay=0.999,
     grad_clip=None,
+    mixup_alpha=0.0,
+    cutmix_alpha=0.0,
+    mix_prob=0.0,
+    eval_tta=False,
+    train_scales=None,
 ):
     os.makedirs(save_dir, exist_ok=True)
 
@@ -331,6 +450,12 @@ def train_model(
         )
     if grad_clip is not None:
         print(f"Gradient clipping: max_norm={grad_clip}")
+    if mix_prob > 0:
+        print(f"Batch mixing: p={mix_prob}, mixup_alpha={mixup_alpha}, cutmix_alpha={cutmix_alpha}")
+    if eval_tta:
+        print("Validation TTA: identity + horizontal/vertical/both flips")
+    if train_scales:
+        print(f"Multi-scale training: {train_scales}")
     print(f"{'='*60}")
 
     if skip_freeze or freeze_epochs <= 0:
@@ -353,6 +478,9 @@ def train_model(
                 model_name, monitor_metric=monitor_metric, monitor_mode=monitor_mode,
                 scaler=scaler, ema=ema_state, early_stopping=stopper,
                 grad_clip=grad_clip,
+                mixup_alpha=mixup_alpha, cutmix_alpha=cutmix_alpha,
+                mix_prob=mix_prob, eval_tta=eval_tta,
+                train_scales=train_scales,
             )
             if should_stop:
                 break
@@ -381,6 +509,9 @@ def train_model(
                     save_dir, model_name, monitor_metric=monitor_metric,
                     monitor_mode=monitor_mode, scaler=scaler, ema=ema_state,
                     early_stopping=stopper, grad_clip=grad_clip,
+                    mixup_alpha=mixup_alpha, cutmix_alpha=cutmix_alpha,
+                    mix_prob=mix_prob, eval_tta=eval_tta,
+                    train_scales=train_scales,
                 )
                 if should_stop:
                     break
@@ -436,6 +567,9 @@ def train_model(
                     model_name, monitor_metric=monitor_metric, monitor_mode=monitor_mode,
                     scaler=scaler, ema=ema_state, early_stopping=stopper,
                     grad_clip=grad_clip,
+                    mixup_alpha=mixup_alpha, cutmix_alpha=cutmix_alpha,
+                    mix_prob=mix_prob, eval_tta=eval_tta,
+                    train_scales=train_scales,
                 )
                 if should_stop:
                     break

@@ -57,3 +57,10 @@ def create_efficientnet_b2(num_classes=2, pretrained=True, attention=None):
         models.EfficientNet_B2_Weights, models.efficientnet_b2,
         num_classes, pretrained, attention,
     )
+
+
+def create_efficientnet_v2_s(num_classes=2, pretrained=True, attention=None):
+    return _create_efficientnet(
+        models.EfficientNet_V2_S_Weights, models.efficientnet_v2_s,
+        num_classes, pretrained, attention,
+    )

@@ -13,7 +13,7 @@ I have tried a lot of preprocessing methods taking inspiration from the SEFFNET_
 
 ## Dont's
 
-Dont change the criteria for saving the base model, it has to be the validation accuracy.
+Dont change the criteria for saving the base model, it has to be the validation loss.
 The split for test set is official, we cant change that.
 
 ## OBjective for now

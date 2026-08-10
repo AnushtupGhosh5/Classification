@@ -99,31 +99,39 @@ def visualize_gradcam(
 
     images_list = []
     labels_list = []
-    cams_list = []
-    preds_list = []
+    num_classes = len(class_names) if class_names else None
+    per_class_limit = max(1, (num_images + num_classes - 1) // num_classes) if num_classes else None
+    class_counts = {index: 0 for index in range(num_classes or 0)}
 
-    model.eval()
+    # FolderDataset is class-sorted, so taking the first batch visualizes only
+    # class 0. Select a balanced sample before computing the expensive CAMs.
     for batch_images, batch_labels in dataloader:
+        for i in range(batch_images.size(0)):
+            label = batch_labels[i].item()
+            if per_class_limit is not None and class_counts[label] >= per_class_limit:
+                continue
+            # Multi-crop evaluation tensors are [views, C, H, W]. Use the
+            # centre view for a single interpretable Grad-CAM panel.
+            image = batch_images[i]
+            if image.dim() == 4:
+                image = image[image.size(0) // 2]
+            images_list.append(image)
+            labels_list.append(label)
+            if per_class_limit is not None:
+                class_counts[label] += 1
+            if len(images_list) >= num_images:
+                break
         if len(images_list) >= num_images:
             break
 
-        batch_dev = batch_images.to(device)
-        with torch.no_grad():
-            out = wrapped(batch_dev)
-            batch_preds = out.argmax(dim=1)
-
-        grayscale_cams = cam(input_tensor=batch_dev)
-
-        for i in range(batch_images.size(0)):
-            if len(images_list) >= num_images:
-                break
-            images_list.append(batch_images[i])
-            labels_list.append(batch_labels[i].item())
-            cams_list.append(grayscale_cams[i])
-            preds_list.append(batch_preds[i].item())
-
     if not images_list:
         return
+
+    images_tensor = torch.stack(images_list).to(device)
+    model.eval()
+    with torch.no_grad():
+        preds_list = wrapped(images_tensor).argmax(dim=1).cpu().tolist()
+    cams_list = cam(input_tensor=images_tensor)
 
     cols = min(4, len(images_list))
     rows = (len(images_list) + cols - 1) // cols
@@ -180,7 +188,13 @@ def visualize_gradcam_per_expert(
     os.makedirs(save_dir, exist_ok=True)
 
     expert_targets = []
-    if hasattr(model, "semantic_branch"):
+    if hasattr(model, "expert_modules"):
+        names = list(getattr(model, "expert_names", model.expert_modules.keys()))
+        for name in names:
+            expert_targets.append(_find_deepest_conv(model.expert_modules[name]))
+        if expert_names is None:
+            expert_names = [name.title() for name in names]
+    elif hasattr(model, "semantic_branch"):
         for i, attr in enumerate(["semantic_branch", "frequency_branch", "geometry_branch"]):
             branch = getattr(model, attr)
             target = _find_deepest_conv(branch)
@@ -196,6 +210,8 @@ def visualize_gradcam_per_expert(
         return
 
     images_batch, labels_batch = next(iter(dataloader))
+    if images_batch.dim() == 5:
+        images_batch = images_batch[:, images_batch.size(1) // 2]
     n = min(num_images, images_batch.size(0))
     images_batch = images_batch[:n].to(device)
     labels_batch = labels_batch[:n]

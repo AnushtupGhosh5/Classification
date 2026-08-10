@@ -8,6 +8,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import torch.nn as nn
+import numpy as np
+import random
+import re
 from torch.utils.data import DataLoader
 
 from src.data.dataset_config import DATASET_REGISTRY, get_dataset_config
@@ -19,7 +22,13 @@ from src.models.resnet34 import create_resnet34
 from src.models.resnet50 import create_resnet50
 from src.models.resnet101 import create_resnet101
 from src.models.densenet import create_densenet121
-from src.models.efficientnet import create_efficientnet_b0, create_efficientnet_b1, create_efficientnet_b2
+from src.models.efficientnet import (
+    create_efficientnet_b0,
+    create_efficientnet_b1,
+    create_efficientnet_b2,
+    create_efficientnet_v2_s,
+)
+from src.models.convnext import create_convnext_tiny
 from src.models.squeezenet import create_squeezenet1_0, create_squeezenet1_1
 from src.models.vgg import create_vgg16
 from src.models.vit import create_vit_b16, create_vit_b32
@@ -30,6 +39,8 @@ from src.models.cef import create_cef
 from src.models.edf import create_edf
 from src.models.caef import create_caef
 from src.models.mief import create_mief
+from src.models.moe_edf import create_moe_edf
+from src.models.lesion_moe import create_lesion_moe
 from src.losses import (
     FocalLoss,
     SEEFNetCEFocalLoss,
@@ -38,7 +49,11 @@ from src.losses import (
     SymmetricCrossEntropyLoss,
 )
 from src.train import train_model
-from src.evaluate import evaluate_all_splits, run_test_evaluation
+from src.evaluate import (
+    evaluate_all_splits,
+    run_expert_diagnostics,
+    run_test_evaluation,
+)
 from src.visualize import plot_training_curves
 
 
@@ -53,6 +68,8 @@ MODEL_REGISTRY = {
     "efficientnet_b0": create_efficientnet_b0,
     "efficientnet_b1": create_efficientnet_b1,
     "efficientnet_b2": create_efficientnet_b2,
+    "efficientnet_v2_s": create_efficientnet_v2_s,
+    "convnext_tiny": create_convnext_tiny,
     "squeezenet1_0": create_squeezenet1_0,
     "squeezenet1_1": create_squeezenet1_1,
     "vgg16": create_vgg16,
@@ -63,6 +80,8 @@ MODEL_REGISTRY = {
     "edf": create_edf,
     "caef": create_caef,
     "mief": create_mief,
+    "moe_edf": create_moe_edf,
+    "lesion_moe": create_lesion_moe,
 }
 
 ATTENTION_CHOICES = ["none", "se", "cbam", "eca"]
@@ -182,7 +201,8 @@ def get_data_loaders(
 
 CSV_FIELDS = [
     "model", "dataset", "attention", "batch_size", "epochs", "lr", "split",
-    "accuracy", "precision", "recall", "f1", "specificity", "loss", "macro_auc",
+    "accuracy", "precision", "recall", "balanced_accuracy", "malignant_recall",
+    "f1", "specificity", "loss", "macro_auc",
 ]
 
 
@@ -205,6 +225,20 @@ def save_results_csv(results, filepath, model_name, dataset_name, attention, bat
             rows.append(row)
 
     file_exists = os.path.exists(filepath)
+    if file_exists:
+        with open(filepath, newline="") as existing_file:
+            reader = csv.DictReader(existing_file)
+            existing_fields = reader.fieldnames or []
+            existing_rows = list(reader)
+        if existing_fields != CSV_FIELDS:
+            # Preserve prior experiments while evolving the metrics schema.
+            temp_path = f"{filepath}.schema-update"
+            with open(temp_path, "w", newline="") as migrated_file:
+                writer = csv.DictWriter(migrated_file, fieldnames=CSV_FIELDS, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(existing_rows)
+            os.replace(temp_path, filepath)
+            print(f"Updated results CSV schema while preserving {len(existing_rows)} existing rows")
     with open(filepath, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
         if not file_exists:
@@ -247,7 +281,7 @@ def main():
                         help="Number of experts to select in CEF")
     parser.add_argument("--disagreement-type", type=str, default="abs",
                         choices=["abs", "cosine", "learnable"],
-                        help="Disagreement computation type in EDF")
+                        help="Pairwise expert disagreement used by EDF and MoE-EDF")
     parser.add_argument("--confidence-type", type=str, default="scalar",
                         choices=["scalar", "channel", "uncertainty", "fuzzy"],
                         help="Confidence estimation type in CAEF")
@@ -255,6 +289,23 @@ def main():
                         help="Common projection dimension for expert features")
     parser.add_argument("--branch-depth", type=int, default=2,
                         help="Number of residual blocks per expert branch (shared_base mode)")
+    parser.add_argument("--router-hidden", type=int, default=128)
+    parser.add_argument("--router-dropout", type=float, default=0.1)
+    parser.add_argument("--router-temperature", type=float, default=1.0)
+    parser.add_argument("--disagreement-scale", type=float, default=1.0)
+    parser.add_argument("--load-balance-weight", type=float, default=0.01)
+    parser.add_argument("--diversity-weight", type=float, default=0.01)
+    parser.add_argument("--expert-loss-weight", type=float, default=0.2)
+    parser.add_argument("--expert-vote-weight", type=float, default=0.5)
+    parser.add_argument("--routing-mode", type=str, default="soft",
+                        choices=["soft", "top2", "top1"],
+                        help="Sample-level routing mode for lesion_moe")
+    parser.add_argument("--expert-aux-weight", type=float, default=0.15,
+                        help="Mean auxiliary expert-classifier loss weight")
+    parser.add_argument("--expert-diversity-weight", type=float, default=0.01,
+                        help="Pairwise expert decorrelation loss weight")
+    parser.add_argument("--router-balance-weight", type=float, default=0.01,
+                        help="Batch-level router load-balancing loss weight")
     parser.add_argument("--expert-mode", type=str, default="shared_base",
                         choices=["shared_base", "multi_layer"],
                         help="Expert mode: shared_base (1 backbone + lightweight branches) or multi_layer (1 backbone, 3 layers)")
@@ -275,13 +326,53 @@ def main():
                         help="Epochs to train with frozen backbone (stage 1)")
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--output-dir", type=str, default="outputs")
+    parser.add_argument("--run-name", type=str, default="",
+                        help="Optional artifact suffix for reproducible experiments")
+    parser.add_argument("--init-checkpoint", type=str, default="",
+                        help="Optional state-dict checkpoint used to initialize fine-tuning")
+    parser.add_argument("--partial-init", action="store_true",
+                        help="Allow missing/new model keys when loading --init-checkpoint")
+    parser.add_argument("--backbone-init-checkpoint", type=str, default="",
+                        help="Initialize only a fusion model's shared backbone")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--amp", action="store_true",
                         help="Use mixed precision (FP16) training to reduce GPU memory")
+    parser.add_argument("--mixup-alpha", type=float, default=0.0,
+                        help="MixUp beta parameter (0 disables MixUp)")
+    parser.add_argument("--cutmix-alpha", type=float, default=0.0,
+                        help="CutMix beta parameter (0 disables CutMix)")
+    parser.add_argument("--mix-prob", type=float, default=0.0,
+                        help="Probability of applying MixUp or CutMix to a batch")
+    parser.add_argument("--classifier-dropout", type=float, default=0.2,
+                        help="Dropout probability in classifier heads that contain dropout")
+    parser.add_argument("--train-scales", type=int, nargs="+", default=None,
+                        help="Optional per-batch training sizes, e.g. 224 256 288")
+    parser.add_argument("--tta", action=argparse.BooleanOptionalAction, default=False,
+                        help="Average identity and flip predictions for validation/test")
+    parser.add_argument("--calibrate-binary", action=argparse.BooleanOptionalAction, default=False,
+                        help="Select binary probability threshold on validation accuracy")
+    parser.add_argument("--augment-style", type=str, default=None,
+                        choices=["balanced", "seefnet", "skin", "skin_focus"],
+                        help="Override the dataset's image augmentation policy")
+    parser.add_argument("--weighted-sampler", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="Enable/disable the dataset's weighted training sampler")
+    parser.add_argument("--sampler-mode", type=str, default=None,
+                        choices=["equal", "sqrt"],
+                        help="Class redistribution used with --weighted-sampler")
+    parser.add_argument("--class-weight-power", type=float, default=None,
+                        help="Exponent applied to inverse-frequency loss weights; 0 disables them")
     args = parser.parse_args()
 
     config = get_dataset_config(args.dataset)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     data_dir = config["data_dir"]
     num_classes = config["num_classes"]
     class_names = config["class_names"]
@@ -306,8 +397,9 @@ def main():
     def override_default(arg_name, override_key=None):
         override_key = override_key or arg_name
         option_name = f"--{arg_name.replace('_', '-')}"
+        negative_option_name = f"--no-{arg_name.replace('_', '-')}"
         arg_value = getattr(args, arg_name)
-        if option_name in supplied_options:
+        if option_name in supplied_options or negative_option_name in supplied_options:
             return arg_value
         if arg_value == parser.get_default(arg_name):
             return overrides.get(override_key, arg_value)
@@ -324,11 +416,23 @@ def main():
         print(f"Train sampling: limit={train_sample_limit}, strategy={train_sampling_strategy}, seed={args.seed}")
     if validate_images:
         print("Image validation: enabled")
-    use_weighted_sampler = overrides.get("use_weighted_sampler", False)
-    sampler_mode = overrides.get("sampler_mode", "equal")
+    use_weighted_sampler = (
+        args.weighted_sampler
+        if "--weighted-sampler" in supplied_options or "--no-weighted-sampler" in supplied_options
+        else overrides.get("use_weighted_sampler", False)
+    )
+    sampler_mode = (
+        args.sampler_mode
+        if "--sampler-mode" in supplied_options
+        else overrides.get("sampler_mode", "equal")
+    )
     if use_weighted_sampler:
         print(f"Oversampling: WeightedRandomSampler enabled (mode={sampler_mode})")
-    augment_style = overrides.get("augment_style", "balanced")
+    augment_style = (
+        args.augment_style
+        if "--augment-style" in supplied_options
+        else overrides.get("augment_style", "balanced")
+    )
     print(f"Train augmentation: {augment_style}")
     img_size = override_default("img_size")
     if img_size != args.img_size:
@@ -348,14 +452,21 @@ def main():
 
     is_vit = args.model in VIT_MODELS
     is_dual_fusion = args.model == "dual_fusion"
-    is_expert_fusion = args.model in ("cef", "edf", "caef", "mief")
+    is_expert_fusion = args.model in (
+        "cef", "edf", "caef", "mief", "moe_edf", "lesion_moe",
+    )
     print(
         f"\nModel: {args.model} | Attention: {args.attention} | "
         f"Batch: {args.batch_size} | Epochs: {args.epochs} | "
         f"Image size: {img_size}"
     )
     if is_expert_fusion:
-        if args.expert_mode == "multi_layer":
+        if args.model == "lesion_moe":
+            print(
+                f"Lesion experts: texture/morphology/semantic/color/boundary | "
+                f"Backbone: {args.backbone1} | Routing: {args.routing_mode}"
+            )
+        elif args.expert_mode == "multi_layer":
             print(f"Expert mode: multi_layer | Backbone: {args.backbone1}")
         else:
             print(f"Expert mode: shared_base | Backbone: {args.backbone1}")
@@ -365,6 +476,21 @@ def main():
             print(f"Disagreement type: {args.disagreement_type}")
         elif args.model == "caef":
             print(f"Confidence type: {args.confidence_type}")
+        elif args.model == "moe_edf":
+            print(
+                f"Disagreement type: {args.disagreement_type} | "
+                f"Router: hidden={args.router_hidden}, "
+                f"dropout={args.router_dropout}, "
+                f"temperature={args.router_temperature}"
+            )
+        elif args.model == "lesion_moe":
+            print(
+                f"Router: hidden={args.router_hidden}, "
+                f"dropout={args.router_dropout}, "
+                f"temperature={args.router_temperature} | "
+                f"Aux/diversity/balance={args.expert_aux_weight}/"
+                f"{args.expert_diversity_weight}/{args.router_balance_weight}"
+            )
         print(f"Projection dim: {args.proj_dim}")
         print(f"Branch depth: {args.branch_depth} residual blocks")
         print(f"Freeze epochs: {args.freeze_epochs} | Stage 2 epochs: {args.epochs - args.freeze_epochs}")
@@ -377,10 +503,29 @@ def main():
         print(f"Freeze epochs: {args.freeze_epochs} | Stage 2 epochs: {args.epochs - args.freeze_epochs}")
 
     attention_arg = args.attention if args.attention != "none" else None
-    if is_expert_fusion:
+    use_imagenet_pretrained = not bool(
+        args.init_checkpoint or args.backbone_init_checkpoint
+    )
+    if args.model == "lesion_moe":
+        model, head_name = create_lesion_moe(
+            num_classes=num_classes,
+            pretrained=use_imagenet_pretrained,
+            attention=attention_arg,
+            backbone1=args.backbone1,
+            proj_dim=args.proj_dim,
+            branch_depth=args.branch_depth,
+            routing_mode=args.routing_mode,
+            router_hidden=args.router_hidden,
+            router_dropout=args.router_dropout,
+            router_temperature=args.router_temperature,
+            expert_aux_weight=args.expert_aux_weight,
+            expert_diversity_weight=args.expert_diversity_weight,
+            router_balance_weight=args.router_balance_weight,
+        )
+    elif is_expert_fusion:
         expert_kwargs = dict(
             num_classes=num_classes,
-            pretrained=True,
+            pretrained=use_imagenet_pretrained,
             attention=attention_arg,
             backbone1=args.backbone1,
             backbone2=args.backbone2,
@@ -395,18 +540,89 @@ def main():
             expert_kwargs["disagreement_type"] = args.disagreement_type
         elif args.model == "caef":
             expert_kwargs["confidence_type"] = args.confidence_type
+        elif args.model == "moe_edf":
+            expert_kwargs.update(
+                disagreement_type=args.disagreement_type,
+                router_hidden=args.router_hidden,
+                router_dropout=args.router_dropout,
+                router_temperature=args.router_temperature,
+                disagreement_scale=args.disagreement_scale,
+                load_balance_weight=args.load_balance_weight,
+                diversity_weight=args.diversity_weight,
+                expert_loss_weight=args.expert_loss_weight,
+                expert_vote_weight=args.expert_vote_weight,
+            )
         model, head_name = MODEL_REGISTRY[args.model](**expert_kwargs)
     elif is_dual_fusion:
         model, head_name = create_dual_fusion(
-            num_classes=num_classes, pretrained=True, attention=attention_arg,
+            num_classes=num_classes, pretrained=use_imagenet_pretrained, attention=attention_arg,
             backbone1=args.backbone1, backbone2=args.backbone2,
             fusion_mode=args.fusion_mode,
         )
     else:
         model, head_name = MODEL_REGISTRY[args.model](
-            num_classes=num_classes, pretrained=True, attention=attention_arg,
+            num_classes=num_classes, pretrained=use_imagenet_pretrained, attention=attention_arg,
         )
     model = model.to(device)
+
+    if args.init_checkpoint:
+        if not os.path.isfile(args.init_checkpoint):
+            parser.error(f"--init-checkpoint does not exist: {args.init_checkpoint}")
+        initial_state = torch.load(
+            args.init_checkpoint,
+            map_location=device,
+            weights_only=True,
+        )
+        incompatible = model.load_state_dict(
+            initial_state,
+            strict=not args.partial_init,
+        )
+        if args.partial_init:
+            print(
+                "Partial checkpoint initialization: "
+                f"missing={list(incompatible.missing_keys)}, "
+                f"unexpected={list(incompatible.unexpected_keys)}"
+            )
+        print(f"Initialized model from checkpoint: {args.init_checkpoint}")
+
+    if args.backbone_init_checkpoint:
+        if not os.path.isfile(args.backbone_init_checkpoint):
+            parser.error(
+                f"--backbone-init-checkpoint does not exist: "
+                f"{args.backbone_init_checkpoint}"
+            )
+        backbone_name = getattr(model, "_backbone_module_name", None)
+        if backbone_name is None:
+            parser.error("--backbone-init-checkpoint requires a fusion model")
+        backbone_container = getattr(model, backbone_name)
+        target = getattr(backbone_container, "backbone", backbone_container)
+        source_state = torch.load(
+            args.backbone_init_checkpoint,
+            map_location=device,
+            weights_only=True,
+        )
+        target_state = target.state_dict()
+        compatible = {
+            key: value for key, value in source_state.items()
+            if key in target_state and target_state[key].shape == value.shape
+        }
+        if not compatible:
+            parser.error(
+                "--backbone-init-checkpoint contained no compatible backbone weights"
+            )
+        target.load_state_dict(compatible, strict=False)
+        print(
+            f"Initialized shared backbone from {args.backbone_init_checkpoint} "
+            f"({len(compatible)}/{len(target_state)} tensors)"
+        )
+
+    classifier_dropout = override_default("classifier_dropout")
+    head = getattr(model, head_name)
+    dropout_layers = [module for module in head.modules() if isinstance(module, nn.Dropout)]
+    for module in dropout_layers:
+        module.p = classifier_dropout
+    if dropout_layers:
+        print(f"Classifier dropout: {classifier_dropout}")
 
     class_counts = train_loader.dataset.get_class_counts()
     weight_counts = overrides.get("class_weight_counts", config.get("original_class_counts", class_counts))
@@ -417,7 +633,11 @@ def main():
         [total / (num_classes * weight_counts.get(i, 1)) for i in range(num_classes)],
         dtype=torch.float32,
     )
-    class_weight_power = overrides.get("class_weight_power", 1.0)
+    class_weight_power = (
+        args.class_weight_power
+        if "--class-weight-power" in supplied_options
+        else overrides.get("class_weight_power", 1.0)
+    )
     class_weights = raw_class_weights.pow(class_weight_power).to(device)
 
     # Label smoothing may be overridden per dataset (e.g. ISIC17 bumps it to
@@ -457,7 +677,9 @@ def main():
         print(f"Training overrides active: {', '.join(active)} (label_smoothing={label_smoothing})")
 
     attn_suffix = f"_{args.attention}" if args.attention != "none" else ""
-    if is_expert_fusion:
+    if args.model == "lesion_moe":
+        model_label = f"lesion_moe_{args.backbone1}_{args.routing_mode}"
+    elif is_expert_fusion:
         if args.expert_mode == "multi_layer":
             parts = [args.model, "ml", args.backbone1]
         else:
@@ -468,11 +690,17 @@ def main():
             parts.append(args.disagreement_type)
         elif args.model == "caef":
             parts.append(args.confidence_type)
+        elif args.model == "moe_edf":
+            parts.extend(["soft", args.disagreement_type])
         model_label = "_".join(parts)
     elif is_dual_fusion:
         model_label = f"dual_fusion_{args.backbone1}_{args.backbone2}{attn_suffix}_{args.fusion_mode}"
     else:
         model_label = f"{args.model}{attn_suffix}"
+    if args.run_name:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.run_name):
+            parser.error("--run-name may contain only letters, numbers, dot, underscore, and hyphen")
+        model_label = f"{model_label}_{args.run_name}"
     model_save_dir = os.path.join(args.output_dir, "models", args.dataset, model_label)
     results_dir = os.path.join(args.output_dir, "results", args.dataset)
     results_csv = os.path.join(results_dir, "results.csv")
@@ -481,8 +709,40 @@ def main():
     train_weight_decay = override_default("weight_decay")
     train_scheduler = override_default("scheduler")
     train_freeze_epochs = override_default("freeze_epochs")
-    monitor_metric = overrides.get("monitor_metric", "loss")
-    monitor_mode = overrides.get("monitor_mode", "min")
+    mixup_alpha = override_default("mixup_alpha")
+    cutmix_alpha = override_default("cutmix_alpha")
+    mix_prob = override_default("mix_prob")
+    eval_tta = override_default("tta")
+    calibrate_binary = override_default("calibrate_binary")
+    if not 0.0 <= mix_prob <= 1.0:
+        parser.error("--mix-prob must be between 0 and 1")
+    if mix_prob > 0 and mixup_alpha <= 0 and cutmix_alpha <= 0:
+        parser.error("--mix-prob requires --mixup-alpha or --cutmix-alpha to be positive")
+    if not 0.0 <= classifier_dropout < 1.0:
+        parser.error("--classifier-dropout must be in [0, 1)")
+    train_scales = args.train_scales
+    if train_scales is not None and any(scale <= 0 for scale in train_scales):
+        parser.error("--train-scales values must be positive")
+    if args.router_hidden <= 0:
+        parser.error("--router-hidden must be positive")
+    if not 0.0 <= args.router_dropout < 1.0:
+        parser.error("--router-dropout must be in [0, 1)")
+    if args.router_temperature <= 0:
+        parser.error("--router-temperature must be positive")
+    if any(value < 0 for value in (
+        args.load_balance_weight,
+        args.diversity_weight,
+        args.expert_loss_weight,
+        args.expert_vote_weight,
+        args.expert_aux_weight,
+        args.expert_diversity_weight,
+        args.router_balance_weight,
+    )):
+        parser.error("MoE auxiliary and vote weights must be non-negative")
+    # Research protocol invariant: checkpointing and early stopping are always
+    # determined by minimum validation loss. Do not make this dataset-tunable.
+    monitor_metric = "loss"
+    monitor_mode = "min"
     scheduler_factor = overrides.get("scheduler_factor", 0.5)
     scheduler_patience = overrides.get("scheduler_patience", 15)
     print(
@@ -520,6 +780,11 @@ def main():
         ema=overrides.get("ema", False),
         ema_decay=overrides.get("ema_decay", 0.999),
         grad_clip=overrides.get("grad_clip", None),
+        mixup_alpha=mixup_alpha,
+        cutmix_alpha=cutmix_alpha,
+        mix_prob=mix_prob,
+        eval_tta=eval_tta,
+        train_scales=train_scales,
     )
 
     plot_training_curves(final_metrics["history"], results_dir, model_label)
@@ -531,18 +796,25 @@ def main():
 
     final_results = evaluate_all_splits(
         model, train_eval_loader, val_loader, test_loader,
-        criterion, device, num_classes,
+        criterion, device, num_classes, tta=eval_tta,
     )
 
     test_metrics = run_test_evaluation(
         model, test_loader, class_names, num_classes,
         device, results_dir, model_label, head_name,
         model_name=args.model, is_expert_fusion=is_expert_fusion,
+        tta=eval_tta,
+        val_loader=val_loader,
+        calibrate_binary=calibrate_binary,
     )
 
-    for split in ["train", "validation", "test"]:
-        if split in final_results:
-            final_results[split]["macro_auc"] = test_metrics.get("macro_auc", 0.0)
+    run_expert_diagnostics(
+        model, val_loader, test_loader, device, num_classes,
+        class_names, results_dir, model_label, tta=eval_tta,
+    )
+
+    if "test" in final_results:
+        final_results["test"].update(test_metrics)
 
     save_results_csv(
         final_results, results_csv,

@@ -75,9 +75,13 @@ class FrequencyBranch(nn.Module):
 
     def forward(self, x):
         x = self.proj(x)
-        fft = torch.fft.fft2(x, norm="ortho")
-        magnitude = torch.log1p(torch.abs(fft))
-        magnitude = torch.fft.fftshift(magnitude, dim=(-2, -1))
+        # CUDA complex-half FFT support is incomplete. Keep this deterministic
+        # expert operation in float32 even when the rest of training uses AMP.
+        with torch.amp.autocast(device_type=x.device.type, enabled=False):
+            fft = torch.fft.fft2(x.float(), norm="ortho")
+            magnitude = torch.log1p(torch.abs(fft))
+            magnitude = torch.fft.fftshift(magnitude, dim=(-2, -1))
+        magnitude = magnitude.to(dtype=x.dtype)
         return self.blocks(magnitude)
 
 

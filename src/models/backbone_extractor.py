@@ -10,6 +10,7 @@ BACKBONE_CHOICES = [
     "mobilenetv2", "mobilenetv3_small", "mobilenetv3_large",
     "resnet34", "resnet50", "resnet101", "densenet121",
     "efficientnet_b0", "efficientnet_b1", "efficientnet_b2",
+    "efficientnet_v2_s", "convnext_tiny",
     "squeezenet1_0", "squeezenet1_1", "vgg16",
     "vit_b16", "vit_b32",
 ]
@@ -138,6 +139,22 @@ def create_backbone(name, pretrained=True):
             weights=models.EfficientNet_B2_Weights.DEFAULT if pretrained else None
         )
         feature_dim = backbone.classifier[1].in_features
+        backbone.classifier = nn.Identity()
+        return BackboneExtractor(backbone, "simple", feature_dim, True)
+
+    if name == "efficientnet_v2_s":
+        backbone = models.efficientnet_v2_s(
+            weights=models.EfficientNet_V2_S_Weights.DEFAULT if pretrained else None
+        )
+        feature_dim = backbone.classifier[1].in_features
+        backbone.classifier = nn.Identity()
+        return BackboneExtractor(backbone, "simple", feature_dim, True)
+
+    if name == "convnext_tiny":
+        backbone = models.convnext_tiny(
+            weights=models.ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None
+        )
+        feature_dim = backbone.classifier[-1].in_features
         backbone.classifier = nn.Identity()
         return BackboneExtractor(backbone, "simple", feature_dim, True)
 
