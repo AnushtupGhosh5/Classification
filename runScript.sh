@@ -1,17 +1,17 @@
 #!/bin/bash
 
-# Next run after the currently-running B1 experiment: baseline-preserving
-# ConvNeXt semantic baseline plus four complementary residual experts. During
-# warm-up it exactly follows the trained classifier while texture/morphology/
-# color/boundary corrections learn under uniform routing. The router is then
-# supervised by each expert's measured reduction in baseline loss.
+# Stabilized ConvNeXt residual-MoE experiment. The pretrained semantic path is
+# immutable throughout training. During warm-up the output exactly follows the
+# baseline while texture/morphology/color/boundary corrections learn. Stage 2
+# ramps a capped correction and distils toward the baseline to prevent the
+# runaway correction observed in v3.
 # These are intentionally explicit: change loss/lr/img-size/etc. here when
 # running an experiment. Command-line values take precedence over dataset
 # defaults in src/data/dataset_config.py.
 #
 python src/main.py \
     --output-dir outputs \
-    --run-name milk10k_complementary_residual_moe_convnext_v3 \
+    --run-name milk10k_complementary_residual_moe_convnext_v4 \
     --dataset milk10k \
     --model lesion_moe \
     --backbone1 convnext_tiny \
@@ -26,9 +26,13 @@ python src/main.py \
     --expert-diversity-weight 0 \
     --router-balance-weight 0.01 \
     --expert-warmup-epochs 5 \
-    --expert-dropout 0.15 \
+    --expert-dropout 0 \
     --correction-aux-weight 0.10 \
     --correction-gate-init 0 \
+    --protect-baseline \
+    --correction-max-scale 0.20 \
+    --correction-ramp-epochs 10 \
+    --residual-distill-weight 0.10 \
     --router-gain-weight 0.20 \
     --router-gain-temperature 0.25 \
     --epochs 50 \

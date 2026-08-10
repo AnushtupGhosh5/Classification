@@ -207,6 +207,14 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes
                 return 0.0
 
             def per_sample_ce(logits, targets):
+                if isinstance(criterion, nn.CrossEntropyLoss):
+                    return F.cross_entropy(
+                        logits,
+                        targets,
+                        weight=criterion.weight,
+                        reduction="none",
+                        label_smoothing=criterion.label_smoothing,
+                    )
                 return F.cross_entropy(logits, targets, reduction="none")
 
             baseline_loss = (
@@ -228,6 +236,23 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes
             ).sum(dim=1).mean()
             return weight * routing_loss
 
+        def residual_distillation_loss(result):
+            baseline_logits = result.get("baseline_logits")
+            final_logits = result.get("logits")
+            weight = getattr(model, "residual_distill_weight", 0.0)
+            if baseline_logits is None or final_logits is None or weight <= 0:
+                return 0.0
+            temperature = 2.0
+            baseline_probabilities = F.softmax(
+                baseline_logits.detach() / temperature, dim=1,
+            )
+            distillation = F.kl_div(
+                F.log_softmax(final_logits / temperature, dim=1),
+                baseline_probabilities,
+                reduction="batchmean",
+            ) * (temperature ** 2)
+            return weight * distillation
+
         optimizer.zero_grad()
         if scaler is not None:
             with torch.amp.autocast(device_type="cuda"):
@@ -239,6 +264,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes
                         + expert_auxiliary_loss(result)
                         + correction_auxiliary_loss(result)
                         + router_gain_auxiliary_loss(result)
+                        + residual_distillation_loss(result)
                         + result.get("aux_loss", 0.0)
                     )
                 else:
@@ -259,6 +285,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes
                     + expert_auxiliary_loss(result)
                     + correction_auxiliary_loss(result)
                     + router_gain_auxiliary_loss(result)
+                    + residual_distillation_loss(result)
                     + result.get("aux_loss", 0.0)
                 )
             else:
@@ -505,7 +532,13 @@ def train_model(
 
     if skip_freeze or freeze_epochs <= 0:
         unfreeze_all(model)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        if hasattr(model, "protect_loaded_baseline"):
+            model.protect_loaded_baseline()
+        optimizer = torch.optim.AdamW(
+            (parameter for parameter in model.parameters() if parameter.requires_grad),
+            lr=lr,
+            weight_decay=weight_decay,
+        )
         scheduler = _make_scheduler(
             optimizer,
             scheduler_type,
@@ -570,8 +603,15 @@ def train_model(
                 stopper.counter = 0
                 stopper.should_stop = False
                 print("Early-stopping patience reset for stage 2")
-            print(f"\n--- Stage 2: Fine-tuning all layers ({stage2_epochs} epochs) ---")
+            protected = bool(getattr(model, "protect_baseline", False))
+            stage2_label = (
+                "Training complementary corrections (baseline protected)"
+                if protected else "Fine-tuning all layers"
+            )
+            print(f"\n--- Stage 2: {stage2_label} ({stage2_epochs} epochs) ---")
             unfreeze_all(model)
+            if hasattr(model, "protect_loaded_baseline"):
+                model.protect_loaded_baseline()
 
             head = getattr(model, head_name)
             head_params_list = list(head.parameters())
@@ -585,24 +625,48 @@ def train_model(
             if backbone_name is not None:
                 # Expert fusion: 3-tier LR (backbone lr/10, branches+fusion lr/5, head lr)
                 backbone = getattr(model, backbone_name)
-                backbone_params = list(backbone.parameters())
+                backbone_params = [
+                    parameter for parameter in backbone.parameters()
+                    if parameter.requires_grad
+                ]
                 # A classifier loaded with the baseline backbone is part of
                 # that protected baseline path and receives the same low LR.
                 if bool(getattr(model, "baseline_loaded_flag", False)):
                     for module_name in ("baseline_norm", "baseline_classifier"):
                         module = getattr(model, module_name, None)
                         if module is not None:
-                            backbone_params.extend(module.parameters())
+                            backbone_params.extend(
+                                parameter for parameter in module.parameters()
+                                if parameter.requires_grad
+                            )
                 backbone_param_ids = set(id(p) for p in backbone_params)
                 middle_params = [
                     p for p in model.parameters()
-                    if id(p) not in backbone_param_ids and id(p) not in head_param_ids
+                    if p.requires_grad
+                    and id(p) not in backbone_param_ids
+                    and id(p) not in head_param_ids
                 ]
-                stage2_optimizer = torch.optim.AdamW([
-                    {"params": backbone_params, "lr": lr / 10, "weight_decay": weight_decay},
-                    {"params": middle_params, "lr": lr / 5, "weight_decay": weight_decay},
-                    {"params": head_params_list, "lr": lr, "weight_decay": weight_decay},
-                ])
+                parameter_groups = []
+                if backbone_params:
+                    parameter_groups.append({
+                        "params": backbone_params, "lr": lr / 10,
+                        "weight_decay": weight_decay,
+                    })
+                if middle_params:
+                    parameter_groups.append({
+                        "params": middle_params, "lr": lr / 5,
+                        "weight_decay": weight_decay,
+                    })
+                trainable_head_params = [
+                    parameter for parameter in head_params_list
+                    if parameter.requires_grad
+                ]
+                if trainable_head_params:
+                    parameter_groups.append({
+                        "params": trainable_head_params, "lr": lr,
+                        "weight_decay": weight_decay,
+                    })
+                stage2_optimizer = torch.optim.AdamW(parameter_groups)
             else:
                 # Regular model: 2-tier LR (backbone lr/10, head lr)
                 backbone_params = [
@@ -623,7 +687,7 @@ def train_model(
 
             for epoch in range(freeze_epochs + 1, num_epochs + 1):
                 best_val_loss, should_stop = _run_epoch(
-                    epoch, num_epochs, "Stage 2 - Fine-tune", model, train_loader,
+                    epoch, num_epochs, f"Stage 2 - {stage2_label}", model, train_loader,
                     val_loader, criterion, stage2_optimizer, device,
                     num_classes, scheduler, history, best_val_loss, save_dir,
                     model_name, monitor_metric=monitor_metric, monitor_mode=monitor_mode,

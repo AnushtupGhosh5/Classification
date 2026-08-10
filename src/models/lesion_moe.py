@@ -407,7 +407,9 @@ class LesionExpertMoE(nn.Module):
                  expert_aux_weight=0.15, expert_diversity_weight=0.01,
                  router_balance_weight=0.01, expert_warmup_epochs=0,
                  expert_dropout=0.0, correction_aux_weight=0.1,
-                 correction_gate_init=0.0):
+                 correction_gate_init=0.0, protect_baseline=False,
+                 correction_max_scale=1.0, correction_ramp_epochs=0,
+                 residual_distill_weight=0.0):
         super().__init__()
         self.feature_pyramid = HierarchicalBackbone(backbone_name, pretrained)
         self._backbone_module_name = "feature_pyramid"
@@ -418,10 +420,20 @@ class LesionExpertMoE(nn.Module):
         self.expert_warmup_epochs = expert_warmup_epochs
         self.expert_dropout = expert_dropout
         self.correction_loss_weight = correction_aux_weight
+        self.protect_baseline = bool(protect_baseline)
+        self.correction_max_scale = float(correction_max_scale)
+        self.correction_ramp_epochs = int(correction_ramp_epochs)
+        self.residual_distill_weight = float(residual_distill_weight)
         self.router_gain_loss_weight = 0.0
         self.router_gain_temperature = 0.25
-        self.current_training_epoch = 0
         self.backbone_name = backbone_name
+        # Persistent because the correction ramp is part of the model selected
+        # by validation loss. Reloading a checkpoint must reproduce the exact
+        # correction strength used in that validation epoch.
+        self.register_buffer(
+            "training_epoch_state", torch.tensor(0, dtype=torch.long),
+            persistent=True,
+        )
         self.register_buffer(
             "baseline_loaded_flag", torch.tensor(False), persistent=True,
         )
@@ -465,7 +477,7 @@ class LesionExpertMoE(nn.Module):
         )
 
     def set_training_epoch(self, epoch):
-        self.current_training_epoch = int(epoch)
+        self.training_epoch_state.fill_(int(epoch))
 
     def load_baseline_classifier(self, state_dict):
         """Load the classifier paired with a backbone-only initialization."""
@@ -515,6 +527,14 @@ class LesionExpertMoE(nn.Module):
             for parameter in module.parameters():
                 parameter.requires_grad = False
 
+    def protect_loaded_baseline(self):
+        """Keep a checkpoint-initialized semantic path immutable."""
+        if not self.protect_baseline or not bool(self.baseline_loaded_flag):
+            return
+        for parameter in self.feature_pyramid.parameters():
+            parameter.requires_grad = False
+        self.freeze_loaded_baseline()
+
     def _recover_rgb(self, normalized_images):
         return (
             normalized_images * self.imagenet_std + self.imagenet_mean
@@ -542,6 +562,7 @@ class LesionExpertMoE(nn.Module):
         )
 
     def forward(self, x):
+        training_epoch = int(self.training_epoch_state.item())
         early, intermediate, deep = self.feature_pyramid(x)
         common_size = intermediate.shape[-2:]
         rgb = self._recover_rgb(x)
@@ -566,7 +587,7 @@ class LesionExpertMoE(nn.Module):
 
         in_warmup = (
             self.expert_warmup_epochs > 0
-            and 0 < self.current_training_epoch <= self.expert_warmup_epochs
+            and 0 < training_epoch <= self.expert_warmup_epochs
         )
         if in_warmup:
             weights = torch.full_like(weights, 1.0 / len(self.expert_names))
@@ -591,6 +612,16 @@ class LesionExpertMoE(nn.Module):
         )
         if in_warmup:
             correction_scale = correction_scale * 0.0
+        else:
+            if self.correction_ramp_epochs > 0:
+                correction_epoch = max(
+                    training_epoch - self.expert_warmup_epochs, 0,
+                )
+                ramp = min(
+                    float(correction_epoch) / self.correction_ramp_epochs, 1.0,
+                )
+                correction_scale = correction_scale * ramp
+            correction_scale = correction_scale * self.correction_max_scale
         logits = baseline_logits + correction_scale.unsqueeze(1) * correction_delta
         expert_logits = baseline_logits.unsqueeze(1) + expert_delta_logits
 
@@ -627,6 +658,10 @@ def create_lesion_moe(num_classes=2, pretrained=True, attention=None,
                       expert_warmup_epochs=0, expert_dropout=0.0,
                       correction_aux_weight=0.1,
                       correction_gate_init=0.0,
+                      protect_baseline=False,
+                      correction_max_scale=1.0,
+                      correction_ramp_epochs=0,
+                      residual_distill_weight=0.0,
                       router_gain_weight=0.0,
                       router_gain_temperature=0.25):
     model = LesionExpertMoE(
@@ -646,6 +681,10 @@ def create_lesion_moe(num_classes=2, pretrained=True, attention=None,
         expert_dropout=expert_dropout,
         correction_aux_weight=correction_aux_weight,
         correction_gate_init=correction_gate_init,
+        protect_baseline=protect_baseline,
+        correction_max_scale=correction_max_scale,
+        correction_ramp_epochs=correction_ramp_epochs,
+        residual_distill_weight=residual_distill_weight,
     )
     model.router_gain_loss_weight = router_gain_weight
     model.router_gain_temperature = router_gain_temperature

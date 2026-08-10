@@ -314,6 +314,15 @@ def main():
                         help="Auxiliary supervision for the MoE correction head")
     parser.add_argument("--correction-gate-init", type=float, default=0.0,
                         help="Initial residual MoE correction gate before tanh")
+    parser.add_argument("--protect-baseline", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="Keep a checkpoint-loaded semantic baseline frozen in stage 2")
+    parser.add_argument("--correction-max-scale", type=float, default=1.0,
+                        help="Maximum absolute multiplier applied to residual corrections")
+    parser.add_argument("--correction-ramp-epochs", type=int, default=0,
+                        help="Epochs after warm-up used to ramp residual correction strength")
+    parser.add_argument("--residual-distill-weight", type=float, default=0.0,
+                        help="KL penalty that keeps corrected predictions near the baseline")
     parser.add_argument("--router-gain-weight", type=float, default=0.0,
                         help="Router supervision from per-expert baseline-loss reduction")
     parser.add_argument("--router-gain-temperature", type=float, default=0.25,
@@ -512,6 +521,10 @@ def main():
                 f"expert_dropout={args.expert_dropout} | "
                 f"correction_aux={args.correction_aux_weight} | "
                 f"gate_init={args.correction_gate_init} | "
+                f"protect_baseline={args.protect_baseline} | "
+                f"max_scale={args.correction_max_scale} | "
+                f"ramp={args.correction_ramp_epochs} | "
+                f"distill={args.residual_distill_weight} | "
                 f"router_gain={args.router_gain_weight}@"
                 f"{args.router_gain_temperature}"
             )
@@ -549,6 +562,10 @@ def main():
             expert_dropout=args.expert_dropout,
             correction_aux_weight=args.correction_aux_weight,
             correction_gate_init=args.correction_gate_init,
+            protect_baseline=args.protect_baseline,
+            correction_max_scale=args.correction_max_scale,
+            correction_ramp_epochs=args.correction_ramp_epochs,
+            residual_distill_weight=args.residual_distill_weight,
             router_gain_weight=args.router_gain_weight,
             router_gain_temperature=args.router_gain_temperature,
         )
@@ -781,6 +798,7 @@ def main():
         args.router_balance_weight,
         args.correction_aux_weight,
         args.router_gain_weight,
+        args.residual_distill_weight,
     )):
         parser.error("MoE auxiliary and vote weights must be non-negative")
     if args.expert_warmup_epochs < 0:
@@ -789,6 +807,10 @@ def main():
         parser.error("--expert-dropout must be in [0, 1)")
     if args.router_gain_temperature <= 0:
         parser.error("--router-gain-temperature must be positive")
+    if args.correction_max_scale < 0:
+        parser.error("--correction-max-scale must be non-negative")
+    if args.correction_ramp_epochs < 0:
+        parser.error("--correction-ramp-epochs must be non-negative")
     ema_enabled = (
         args.ema if "--ema" in supplied_options or "--no-ema" in supplied_options
         else overrides.get("ema", False)

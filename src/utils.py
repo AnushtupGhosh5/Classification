@@ -132,7 +132,9 @@ def evaluate_model(model, dataloader, criterion, device, num_classes, tta=False)
     all_preds = []
     all_labels = []
     all_logits = []
-    total_loss = 0.0
+    total_classification_loss = 0.0
+    total_classification_weight = 0.0
+    total_aux_loss = 0.0
     total_samples = 0
     router_weights = []
     correction_scales = []
@@ -144,9 +146,25 @@ def evaluate_model(model, dataloader, criterion, device, num_classes, tta=False)
         outputs, aux_loss, details = _forward_with_tta_details(
             model, images, tta=tta,
         )
-        loss = criterion(outputs, labels) + aux_loss
-
-        total_loss += loss.item() * images.size(0)
+        classification_loss = criterion(outputs, labels)
+        if isinstance(criterion, nn.CrossEntropyLoss) and criterion.weight is not None:
+            # Weighted CE with reduction="mean" is normalized by the sum of
+            # target-class weights, not batch size. Accumulating by batch size
+            # makes validation loss depend on batch boundaries and batch size.
+            classification_weight = float(
+                criterion.weight[labels].sum().detach().cpu()
+            )
+        else:
+            classification_weight = float(images.size(0))
+        total_classification_loss += (
+            float(classification_loss.detach().cpu()) * classification_weight
+        )
+        total_classification_weight += classification_weight
+        aux_value = (
+            float(aux_loss.detach().cpu())
+            if torch.is_tensor(aux_loss) else float(aux_loss)
+        )
+        total_aux_loss += aux_value * images.size(0)
         total_samples += images.size(0)
 
         preds = outputs.argmax(dim=1)
@@ -158,7 +176,12 @@ def evaluate_model(model, dataloader, criterion, device, num_classes, tta=False)
         if details.get("correction_scale") is not None:
             correction_scales.append(details["correction_scale"].cpu())
 
-    avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
+    avg_classification_loss = (
+        total_classification_loss / total_classification_weight
+        if total_classification_weight > 0 else 0.0
+    )
+    avg_aux_loss = total_aux_loss / total_samples if total_samples > 0 else 0.0
+    avg_loss = avg_classification_loss + avg_aux_loss
     metrics = compute_metrics(all_labels, all_preds, num_classes)
     metrics["loss"] = round(avg_loss, 4)
     if correction_scales:
