@@ -64,6 +64,13 @@ def run_expert_diagnostics(model, val_loader, test_loader, device, num_classes,
             f"  Router entropy: {report['router_entropy']:.4f} / "
             f"{report['maximum_entropy']:.4f}"
         )
+        if "baseline_path" in report:
+            baseline = report["baseline_path"]
+            print(
+                f"  Baseline path Acc/F1/BAcc={baseline['accuracy']:.3f}/"
+                f"{baseline['f1']:.3f}/{baseline['balanced_accuracy']:.3f} | "
+                f"correction scale={report.get('correction_scale', 0.0):.4f}"
+            )
         for name, routing in report["routing"].items():
             expert_metrics = report["standalone_experts"][name]
             print(

@@ -306,6 +306,18 @@ def main():
                         help="Pairwise expert decorrelation loss weight")
     parser.add_argument("--router-balance-weight", type=float, default=0.01,
                         help="Batch-level router load-balancing loss weight")
+    parser.add_argument("--expert-warmup-epochs", type=int, default=0,
+                        help="Epochs of uniform routing and zero MoE correction")
+    parser.add_argument("--expert-dropout", type=float, default=0.0,
+                        help="Probability of masking each expert route during training")
+    parser.add_argument("--correction-aux-weight", type=float, default=0.1,
+                        help="Auxiliary supervision for the MoE correction head")
+    parser.add_argument("--correction-gate-init", type=float, default=0.0,
+                        help="Initial residual MoE correction gate before tanh")
+    parser.add_argument("--router-gain-weight", type=float, default=0.0,
+                        help="Router supervision from per-expert baseline-loss reduction")
+    parser.add_argument("--router-gain-temperature", type=float, default=0.25,
+                        help="Soft-target temperature for expert correction gains")
     parser.add_argument("--expert-mode", type=str, default="shared_base",
                         choices=["shared_base", "multi_layer"],
                         help="Expert mode: shared_base (1 backbone + lightweight branches) or multi_layer (1 backbone, 3 layers)")
@@ -363,6 +375,10 @@ def main():
                         help="Class redistribution used with --weighted-sampler")
     parser.add_argument("--class-weight-power", type=float, default=None,
                         help="Exponent applied to inverse-frequency loss weights; 0 disables them")
+    parser.add_argument("--ema", action=argparse.BooleanOptionalAction, default=None,
+                        help="Enable/disable exponential moving-average evaluation")
+    parser.add_argument("--ema-decay", type=float, default=None,
+                        help="EMA decay override")
     args = parser.parse_args()
 
     config = get_dataset_config(args.dataset)
@@ -463,8 +479,8 @@ def main():
     if is_expert_fusion:
         if args.model == "lesion_moe":
             print(
-                f"Lesion experts: texture/morphology/semantic/color/boundary | "
-                f"Backbone: {args.backbone1} | Routing: {args.routing_mode}"
+                f"Semantic baseline: {args.backbone1} | Complementary experts: "
+                f"texture/morphology/color/boundary | Routing: {args.routing_mode}"
             )
         elif args.expert_mode == "multi_layer":
             print(f"Expert mode: multi_layer | Backbone: {args.backbone1}")
@@ -490,6 +506,14 @@ def main():
                 f"temperature={args.router_temperature} | "
                 f"Aux/diversity/balance={args.expert_aux_weight}/"
                 f"{args.expert_diversity_weight}/{args.router_balance_weight}"
+            )
+            print(
+                f"Residual MoE: warmup={args.expert_warmup_epochs} | "
+                f"expert_dropout={args.expert_dropout} | "
+                f"correction_aux={args.correction_aux_weight} | "
+                f"gate_init={args.correction_gate_init} | "
+                f"router_gain={args.router_gain_weight}@"
+                f"{args.router_gain_temperature}"
             )
         print(f"Projection dim: {args.proj_dim}")
         print(f"Branch depth: {args.branch_depth} residual blocks")
@@ -521,6 +545,12 @@ def main():
             expert_aux_weight=args.expert_aux_weight,
             expert_diversity_weight=args.expert_diversity_weight,
             router_balance_weight=args.router_balance_weight,
+            expert_warmup_epochs=args.expert_warmup_epochs,
+            expert_dropout=args.expert_dropout,
+            correction_aux_weight=args.correction_aux_weight,
+            correction_gate_init=args.correction_gate_init,
+            router_gain_weight=args.router_gain_weight,
+            router_gain_temperature=args.router_gain_temperature,
         )
     elif is_expert_fusion:
         expert_kwargs = dict(
@@ -615,6 +645,18 @@ def main():
             f"Initialized shared backbone from {args.backbone_init_checkpoint} "
             f"({len(compatible)}/{len(target_state)} tensors)"
         )
+        if hasattr(model, "load_baseline_classifier"):
+            classifier_tensors = model.load_baseline_classifier(source_state)
+            if classifier_tensors:
+                print(
+                    "Initialized residual baseline classifier from checkpoint "
+                    f"({classifier_tensors} tensors)"
+                )
+            else:
+                print(
+                    "Backbone checkpoint had no compatible baseline classifier; "
+                    "the residual baseline head will be learned from scratch"
+                )
 
     classifier_dropout = override_default("classifier_dropout")
     head = getattr(model, head_name)
@@ -737,8 +779,26 @@ def main():
         args.expert_aux_weight,
         args.expert_diversity_weight,
         args.router_balance_weight,
+        args.correction_aux_weight,
+        args.router_gain_weight,
     )):
         parser.error("MoE auxiliary and vote weights must be non-negative")
+    if args.expert_warmup_epochs < 0:
+        parser.error("--expert-warmup-epochs must be non-negative")
+    if not 0.0 <= args.expert_dropout < 1.0:
+        parser.error("--expert-dropout must be in [0, 1)")
+    if args.router_gain_temperature <= 0:
+        parser.error("--router-gain-temperature must be positive")
+    ema_enabled = (
+        args.ema if "--ema" in supplied_options or "--no-ema" in supplied_options
+        else overrides.get("ema", False)
+    )
+    ema_decay = (
+        args.ema_decay if "--ema-decay" in supplied_options
+        else overrides.get("ema_decay", 0.999)
+    )
+    if not 0.0 <= ema_decay < 1.0:
+        parser.error("--ema-decay must be in [0, 1)")
     # Research protocol invariant: checkpointing and early stopping are always
     # determined by minimum validation loss. Do not make this dataset-tunable.
     monitor_metric = "loss"
@@ -757,7 +817,6 @@ def main():
         head_name=head_name,
         train_loader=train_loader,
         val_loader=val_loader,
-        test_loader=test_loader,
         criterion=criterion,
         lr=train_lr,
         device=device,
@@ -777,8 +836,8 @@ def main():
         early_stopping=overrides.get("early_stopping", False),
         es_patience=overrides.get("es_patience", 15),
         es_min_delta=overrides.get("es_min_delta", 0.0),
-        ema=overrides.get("ema", False),
-        ema_decay=overrides.get("ema_decay", 0.999),
+        ema=ema_enabled,
+        ema_decay=ema_decay,
         grad_clip=overrides.get("grad_clip", None),
         mixup_alpha=mixup_alpha,
         cutmix_alpha=cutmix_alpha,

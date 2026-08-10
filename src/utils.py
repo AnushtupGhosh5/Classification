@@ -99,6 +99,7 @@ def _forward_with_tta_details(model, images, tta=False):
             for key in (
                 "router_weights", "router_probabilities", "router_active",
                 "expert_logits", "expert_embeddings", "expert_disagreement",
+                "baseline_logits", "correction_logits", "correction_scale",
             ):
                 value = result.get(key)
                 if value is not None:
@@ -134,6 +135,7 @@ def evaluate_model(model, dataloader, criterion, device, num_classes, tta=False)
     total_loss = 0.0
     total_samples = 0
     router_weights = []
+    correction_scales = []
 
     for images, labels in dataloader:
         images = images.to(device)
@@ -153,10 +155,16 @@ def evaluate_model(model, dataloader, criterion, device, num_classes, tta=False)
         all_logits.extend(outputs.cpu().numpy())
         if details.get("router_weights") is not None:
             router_weights.append(details["router_weights"].cpu())
+        if details.get("correction_scale") is not None:
+            correction_scales.append(details["correction_scale"].cpu())
 
     avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
     metrics = compute_metrics(all_labels, all_preds, num_classes)
     metrics["loss"] = round(avg_loss, 4)
+    if correction_scales:
+        metrics["correction_scale"] = round(
+            float(torch.cat(correction_scales).mean()), 6,
+        )
     if router_weights:
         weights = torch.cat(router_weights, dim=0)
         for index, value in enumerate(weights.mean(dim=0).tolist()):
@@ -178,6 +186,9 @@ def compute_expert_diagnostics(model, dataloader, device, num_classes,
     active_batches = []
     logits_batches = []
     embedding_batches = []
+    baseline_batches = []
+    correction_batches = []
+    correction_scale_batches = []
     labels_batches = []
 
     for images, labels in dataloader:
@@ -191,6 +202,12 @@ def compute_expert_diagnostics(model, dataloader, device, num_classes,
             active_batches.append(active.cpu())
         logits_batches.append(details["expert_logits"].cpu())
         embedding_batches.append(details["expert_embeddings"].cpu())
+        if details.get("baseline_logits") is not None:
+            baseline_batches.append(details["baseline_logits"].cpu())
+        if details.get("correction_logits") is not None:
+            correction_batches.append(details["correction_logits"].cpu())
+        if details.get("correction_scale") is not None:
+            correction_scale_batches.append(details["correction_scale"].cpu())
         labels_batches.append(labels.cpu())
 
     if not weights_batches:
@@ -227,6 +244,19 @@ def compute_expert_diagnostics(model, dataloader, device, num_classes,
         predictions = expert_logits[:, index].argmax(dim=1).numpy()
         standalone[name] = compute_metrics(labels_list, predictions, num_classes)
 
+    baseline_metrics = None
+    if baseline_batches:
+        baseline_logits = torch.cat(baseline_batches)
+        baseline_metrics = compute_metrics(
+            labels_list, baseline_logits.argmax(dim=1).numpy(), num_classes,
+        )
+    correction_metrics = None
+    if correction_batches:
+        correction_logits = torch.cat(correction_batches)
+        correction_metrics = compute_metrics(
+            labels_list, correction_logits.argmax(dim=1).numpy(), num_classes,
+        )
+
     similarity = torch.einsum("bed,bfd->bef", embeddings, embeddings).mean(dim=0)
     similarity_rows = {
         names[row]: {
@@ -247,7 +277,7 @@ def compute_expert_diagnostics(model, dataloader, device, num_classes,
             for index in range(num_experts)
         }
 
-    return {
+    report = {
         "num_samples": int(labels.numel()),
         "routing": routing,
         "router_entropy": round(float(entropy), 6),
@@ -256,6 +286,17 @@ def compute_expert_diagnostics(model, dataloader, device, num_classes,
         "mean_cosine_similarity": similarity_rows,
         "class_conditional_routing": class_conditional,
     }
+    if baseline_metrics is not None:
+        report["baseline_path"] = baseline_metrics
+    if correction_metrics is not None:
+        report["correction_path"] = correction_metrics
+    if correction_scale_batches:
+        scales = torch.cat(correction_scale_batches)
+        report["correction_scale"] = round(float(scales.mean()), 6)
+        report["correction_scale_std"] = round(
+            float(scales.std(unbiased=False)), 6,
+        )
+    return report
 
 
 @torch.no_grad()
@@ -284,16 +325,27 @@ def extract_features(model, dataloader, device, head_name="classifier"):
 
         if "feat" in features_capture:
             feat = features_capture["feat"]
-            if feat.dim() > 2:
+            if feat.dim() == 4:
                 feat = feat.mean(dim=[2, 3])
+            elif feat.dim() == 3:
+                # Complementary delta head input: [batch, experts, channels].
+                feat = feat.mean(dim=1)
+            elif feat.dim() > 4:
+                feat = feat.flatten(2).mean(dim=2)
             if crop_views > 1:
                 feat = feat.reshape(batch_size, crop_views, -1).mean(dim=1)
             all_features.append(feat.cpu().numpy())
         else:
             with torch.no_grad():
                 feat = model(model_input)
-            if feat.dim() > 2:
+            if isinstance(feat, dict):
+                feat = feat["logits"]
+            if feat.dim() == 4:
                 feat = feat.mean(dim=[2, 3])
+            elif feat.dim() == 3:
+                feat = feat.mean(dim=1)
+            elif feat.dim() > 4:
+                feat = feat.flatten(2).mean(dim=2)
             if crop_views > 1:
                 feat = feat.reshape(batch_size, crop_views, -1).mean(dim=1)
             all_features.append(feat.cpu().numpy())

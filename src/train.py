@@ -104,6 +104,8 @@ def freeze_backbone(model, head_name):
         backbone = getattr(model, backbone_name)
         for param in backbone.parameters():
             param.requires_grad = False
+        if hasattr(model, "freeze_loaded_baseline"):
+            model.freeze_loaded_baseline()
     else:
         # Regular model: freeze all, unfreeze head only
         for param in model.parameters():
@@ -129,9 +131,13 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes
     router_weight_sum = None
     router_entropy_sum = 0.0
     router_sample_count = 0
+    correction_scale_sum = 0.0
+    correction_scale_count = 0
 
     if hasattr(criterion, "set_epoch") and epoch is not None and num_epochs is not None:
         criterion.set_epoch(epoch, num_epochs)
+    if hasattr(model, "set_training_epoch") and epoch is not None:
+        model.set_training_epoch(epoch)
 
     for images, labels in tqdm(dataloader, desc="  Training", leave=False):
         images = images.to(device)
@@ -182,6 +188,46 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes
             ]
             return weight * torch.stack(losses).mean()
 
+        def correction_auxiliary_loss(result):
+            correction_logits = result.get("correction_logits")
+            weight = getattr(model, "correction_loss_weight", 0.0)
+            if correction_logits is None or weight <= 0:
+                return 0.0
+            return weight * mixed_loss(correction_logits)
+
+        def router_gain_auxiliary_loss(result):
+            baseline_logits = result.get("baseline_logits")
+            expert_logits = result.get("expert_logits")
+            probabilities = result.get("router_probabilities")
+            weight = getattr(model, "router_gain_loss_weight", 0.0)
+            if (
+                baseline_logits is None or expert_logits is None
+                or probabilities is None or weight <= 0
+            ):
+                return 0.0
+
+            def per_sample_ce(logits, targets):
+                return F.cross_entropy(logits, targets, reduction="none")
+
+            baseline_loss = (
+                lam * per_sample_ce(baseline_logits, labels_a)
+                + (1.0 - lam) * per_sample_ce(baseline_logits, labels_b)
+            )
+            expert_losses = torch.stack([
+                lam * per_sample_ce(expert_logits[:, index], labels_a)
+                + (1.0 - lam) * per_sample_ce(expert_logits[:, index], labels_b)
+                for index in range(expert_logits.size(1))
+            ], dim=1)
+            gains = baseline_loss.unsqueeze(1) - expert_losses
+            temperature = max(
+                float(getattr(model, "router_gain_temperature", 0.25)), 1e-4,
+            )
+            targets = F.softmax(gains.detach() / temperature, dim=1)
+            routing_loss = -(
+                targets * probabilities.clamp_min(1e-8).log()
+            ).sum(dim=1).mean()
+            return weight * routing_loss
+
         optimizer.zero_grad()
         if scaler is not None:
             with torch.amp.autocast(device_type="cuda"):
@@ -191,6 +237,8 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes
                     loss = (
                         mixed_loss(outputs)
                         + expert_auxiliary_loss(result)
+                        + correction_auxiliary_loss(result)
+                        + router_gain_auxiliary_loss(result)
                         + result.get("aux_loss", 0.0)
                     )
                 else:
@@ -209,6 +257,8 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes
                 loss = (
                     mixed_loss(outputs)
                     + expert_auxiliary_loss(result)
+                    + correction_auxiliary_loss(result)
+                    + router_gain_auxiliary_loss(result)
                     + result.get("aux_loss", 0.0)
                 )
             else:
@@ -234,6 +284,10 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes
                 .sum().cpu()
             )
             router_sample_count += router_weights.size(0)
+        if isinstance(result, dict) and result.get("correction_scale") is not None:
+            scales = result["correction_scale"].detach().float()
+            correction_scale_sum += float(scales.sum().cpu())
+            correction_scale_count += scales.numel()
 
         running_loss += loss.item() * images.size(0)
         preds = outputs.argmax(dim=1)
@@ -243,6 +297,10 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes
     avg_loss = running_loss / len(all_labels) if all_labels else 0.0
     metrics = compute_metrics(all_labels, all_preds, num_classes)
     metrics["loss"] = round(avg_loss, 4)
+    if correction_scale_count:
+        metrics["correction_scale"] = round(
+            correction_scale_sum / correction_scale_count, 6,
+        )
     if router_sample_count:
         mean_weights = router_weight_sum / router_sample_count
         for index, weight in enumerate(mean_weights.tolist()):
@@ -260,23 +318,8 @@ def _save_best(model, save_dir, model_name, val_loss, best_val_loss):
     return val_loss
 
 
-def _log_epoch(prefix, train_m, val_m, test_m):
-    print(
-        f"  Train - Loss: {train_m['loss']:.4f} | "
-        f"Acc: {train_m['accuracy']:.4f} | F1: {train_m['f1']:.4f}"
-    )
-    print(
-        f"  Val   - Loss: {val_m['loss']:.4f} | "
-        f"Acc: {val_m['accuracy']:.4f} | F1: {val_m['f1']:.4f}"
-    )
-    print(
-        f"  Test  - Loss: {test_m['loss']:.4f} | "
-        f"Acc: {test_m['accuracy']:.4f} | F1: {test_m['f1']:.4f}"
-    )
-
-
 def _run_epoch(epoch, num_epochs, stage_label, model, train_loader, val_loader,
-               test_loader, criterion, optimizer, device, num_classes, scheduler,
+               criterion, optimizer, device, num_classes, scheduler,
                history, best_monitor_score, save_dir, model_name, monitor_metric="loss",
                monitor_mode="min", scaler=None, ema=None, early_stopping=None,
                grad_clip=None, mixup_alpha=0.0, cutmix_alpha=0.0, mix_prob=0.0,
@@ -301,7 +344,6 @@ def _run_epoch(epoch, num_epochs, stage_label, model, train_loader, val_loader,
         )
         # The official test set is intentionally not inspected during training.
         # It is evaluated once after selecting the checkpoint on validation loss.
-        test_metrics = None
     finally:
         if ema is not None:
             ema.restore(model)
@@ -331,6 +373,11 @@ def _run_epoch(epoch, num_epochs, stage_label, model, train_loader, val_loader,
         print(
             f"          Router usage: [{usage}] | "
             f"Entropy: {train_metrics['router_entropy']:.3f}"
+        )
+    if "correction_scale" in train_metrics:
+        print(
+            f"          Residual correction scale: "
+            f"{train_metrics['correction_scale']:.4f}"
         )
     print(
         f"  Val   - Loss: {val_metrics['loss']:.4f} | "
@@ -386,7 +433,6 @@ def train_model(
     head_name,
     train_loader,
     val_loader,
-    test_loader,
     criterion,
     lr,
     device,
@@ -421,7 +467,6 @@ def train_model(
     history = {
         "train": [],
         "val": [],
-        "test": [],
     }
 
     # EMA and EarlyStopping are created once so they persist across the freeze
@@ -473,7 +518,7 @@ def train_model(
         for epoch in range(1, num_epochs + 1):
             best_val_loss, should_stop = _run_epoch(
                 epoch, num_epochs, "Full Fine-tune", model, train_loader,
-                val_loader, test_loader, criterion, optimizer, device,
+                val_loader, criterion, optimizer, device,
                 num_classes, scheduler, history, best_val_loss, save_dir,
                 model_name, monitor_metric=monitor_metric, monitor_mode=monitor_mode,
                 scaler=scaler, ema=ema_state, early_stopping=stopper,
@@ -504,7 +549,7 @@ def train_model(
             for epoch in range(1, freeze_epochs + 1):
                 best_val_loss, should_stop = _run_epoch(
                     epoch, num_epochs, "Stage 1 - Frozen", model, train_loader,
-                    val_loader, test_loader, criterion, stage1_optimizer, device,
+                    val_loader, criterion, stage1_optimizer, device,
                     num_classes, stage1_scheduler, history, best_val_loss,
                     save_dir, model_name, monitor_metric=monitor_metric,
                     monitor_mode=monitor_mode, scaler=scaler, ema=ema_state,
@@ -518,11 +563,21 @@ def train_model(
 
         stage2_epochs = num_epochs - freeze_epochs
         if stage2_epochs > 0 and not (stopper is not None and stopper.should_stop):
+            if stopper is not None:
+                # Constant baseline-preserving warm-up epochs should not spend
+                # the correction phase's patience budget. Keep the best loss,
+                # but grant stage 2 a fresh consecutive-no-improvement window.
+                stopper.counter = 0
+                stopper.should_stop = False
+                print("Early-stopping patience reset for stage 2")
             print(f"\n--- Stage 2: Fine-tuning all layers ({stage2_epochs} epochs) ---")
             unfreeze_all(model)
 
             head = getattr(model, head_name)
             head_params_list = list(head.parameters())
+            correction_gate = getattr(model, "correction_gate", None)
+            if correction_gate is not None:
+                head_params_list.extend(correction_gate.parameters())
             head_param_ids = set(id(p) for p in head_params_list)
 
             backbone_name = getattr(model, "_backbone_module_name", None)
@@ -531,6 +586,13 @@ def train_model(
                 # Expert fusion: 3-tier LR (backbone lr/10, branches+fusion lr/5, head lr)
                 backbone = getattr(model, backbone_name)
                 backbone_params = list(backbone.parameters())
+                # A classifier loaded with the baseline backbone is part of
+                # that protected baseline path and receives the same low LR.
+                if bool(getattr(model, "baseline_loaded_flag", False)):
+                    for module_name in ("baseline_norm", "baseline_classifier"):
+                        module = getattr(model, module_name, None)
+                        if module is not None:
+                            backbone_params.extend(module.parameters())
                 backbone_param_ids = set(id(p) for p in backbone_params)
                 middle_params = [
                     p for p in model.parameters()
@@ -562,7 +624,7 @@ def train_model(
             for epoch in range(freeze_epochs + 1, num_epochs + 1):
                 best_val_loss, should_stop = _run_epoch(
                     epoch, num_epochs, "Stage 2 - Fine-tune", model, train_loader,
-                    val_loader, test_loader, criterion, stage2_optimizer, device,
+                    val_loader, criterion, stage2_optimizer, device,
                     num_classes, scheduler, history, best_val_loss, save_dir,
                     model_name, monitor_metric=monitor_metric, monitor_mode=monitor_mode,
                     scaler=scaler, ema=ema_state, early_stopping=stopper,
@@ -577,7 +639,6 @@ def train_model(
     final_metrics = {
         "train": history["train"][-1] if history["train"] else {},
         "val": history["val"][-1] if history["val"] else {},
-        "test": history["test"][-1] if history["test"] else {},
         "best_val_loss": best_val_loss,
         "history": history,
     }

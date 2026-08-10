@@ -1,11 +1,12 @@
-"""Hierarchical lesion-specialized mixture of experts.
+"""Hierarchical complementary residual mixture of experts.
 
-The model runs one shared CNN and sends deliberately chosen hierarchy levels
-to texture, morphology, and semantic specialists.  Color and boundary experts
-retain input/early spatial information.  A sample-level router uses compact
-expert disagreement descriptors to weight the actual expert feature maps.
+The shared CNN and its classifier are the semantic baseline. Four specialists
+produce only complementary logit corrections: texture, morphology, color, and
+boundary. A sample-level router uses compact disagreement descriptors to route
+those corrections without duplicating or replacing the semantic baseline.
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,15 +14,17 @@ import torch.nn.functional as F
 from src.models.backbone_extractor import create_backbone
 
 
-EXPERT_NAMES = ("texture", "morphology", "semantic", "color", "boundary")
+EXPERT_NAMES = ("texture", "morphology", "color", "boundary")
 
 # These stages are semantic choices, not equal-length guesses. EfficientNet
 # stage 2 retains fine detail, stage 5 is the last 1/16 stage, and stage 8 is
-# the final representation. ResNet/DenseNet mappings follow the same intent.
+# the final representation. ConvNeXt stages 1/5/7 retain 1/4, 1/16, and 1/32
+# resolution respectively. ResNet/DenseNet mappings follow the same intent.
 _PYRAMID_TARGETS = {
     "efficientnet_b0": (("features", "2"), ("features", "5"), ("features", "8")),
     "efficientnet_b1": (("features", "2"), ("features", "5"), ("features", "8")),
     "efficientnet_b2": (("features", "2"), ("features", "5"), ("features", "8")),
+    "convnext_tiny": (("features", "1"), ("features", "5"), ("features", "7")),
     "resnet34": (("layer1",), ("layer2",), ("layer4",)),
     "resnet50": (("layer1",), ("layer2",), ("layer4",)),
     "resnet101": (("layer1",), ("layer2",), ("layer4",)),
@@ -278,7 +281,7 @@ class DisagreementAwareRouter(nn.Module):
 
     def forward(self, pooled):
         # pooled: [B, E, D]. The same comparison projection makes pairwise
-        # cosine and absolute distances meaningful across all five experts.
+        # cosine and absolute distances meaningful across all experts.
         comparison = F.normalize(self.comparison_projection(pooled), dim=-1)
         num_experts = pooled.shape[1]
         off_diagonal = 1.0 - torch.eye(
@@ -330,8 +333,70 @@ class DisagreementAwareRouter(nn.Module):
         return weights, probabilities, comparison, disagreement
 
 
+class ComplementaryDeltaHeads(nn.Module):
+    """One zero-initialized class-logit correction head per expert."""
+
+    def __init__(self, proj_dim, num_classes, num_experts, dropout=0.25):
+        super().__init__()
+        self.heads = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(proj_dim),
+                nn.Dropout(dropout),
+                nn.Linear(proj_dim, num_classes),
+            )
+            for _ in range(num_experts)
+        ])
+        for head in self.heads:
+            nn.init.zeros_(head[-1].weight)
+            nn.init.zeros_(head[-1].bias)
+
+    def forward(self, pooled):
+        return torch.stack([
+            head(pooled[:, index])
+            for index, head in enumerate(self.heads)
+        ], dim=1)
+
+
+class SelectiveCorrectionGate(nn.Module):
+    """Per-sample gate from baseline uncertainty and expert disagreement."""
+
+    def __init__(self, num_classes, hidden_dim=16, initial_bias=0.0):
+        super().__init__()
+        self.num_classes = num_classes
+        self.network = nn.Sequential(
+            nn.Linear(5, hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden_dim, 1),
+        )
+        nn.init.zeros_(self.network[-1].weight)
+        nn.init.constant_(self.network[-1].bias, float(initial_bias))
+
+    def forward(self, baseline_logits, disagreement):
+        # Stop gate gradients from changing the protected baseline merely to
+        # manipulate its uncertainty values.
+        probabilities = F.softmax(baseline_logits.detach(), dim=1)
+        top2 = probabilities.topk(min(2, self.num_classes), dim=1).values
+        confidence = top2[:, 0]
+        margin = (
+            top2[:, 0] - top2[:, 1]
+            if top2.shape[1] > 1 else top2[:, 0]
+        )
+        entropy = -(
+            probabilities * probabilities.clamp_min(1e-8).log()
+        ).sum(dim=1) / max(math.log(float(self.num_classes)), 1e-8)
+        mean_disagreement = disagreement.mean(dim=1)
+        features = torch.stack([
+            1.0 - confidence,
+            entropy,
+            1.0 - margin,
+            mean_disagreement[:, 0],
+            mean_disagreement[:, 1],
+        ], dim=1)
+        return torch.tanh(self.network(features).squeeze(1))
+
+
 class LesionExpertMoE(nn.Module):
-    """Five lesion specialists with proper sample-level feature routing."""
+    """Semantic baseline plus four routed complementary corrections."""
 
     expert_names = EXPERT_NAMES
 
@@ -340,7 +405,9 @@ class LesionExpertMoE(nn.Module):
                  routing_mode="soft", router_hidden=128,
                  router_dropout=0.1, router_temperature=1.0,
                  expert_aux_weight=0.15, expert_diversity_weight=0.01,
-                 router_balance_weight=0.01):
+                 router_balance_weight=0.01, expert_warmup_epochs=0,
+                 expert_dropout=0.0, correction_aux_weight=0.1,
+                 correction_gate_init=0.0):
         super().__init__()
         self.feature_pyramid = HierarchicalBackbone(backbone_name, pretrained)
         self._backbone_module_name = "feature_pyramid"
@@ -348,14 +415,28 @@ class LesionExpertMoE(nn.Module):
         self.expert_loss_weight = expert_aux_weight
         self.expert_diversity_weight = expert_diversity_weight
         self.router_balance_weight = router_balance_weight
+        self.expert_warmup_epochs = expert_warmup_epochs
+        self.expert_dropout = expert_dropout
+        self.correction_loss_weight = correction_aux_weight
+        self.router_gain_loss_weight = 0.0
+        self.router_gain_temperature = 0.25
+        self.current_training_epoch = 0
+        self.backbone_name = backbone_name
+        self.register_buffer(
+            "baseline_loaded_flag", torch.tensor(False), persistent=True,
+        )
 
         early_channels, intermediate_channels, deep_channels = self.feature_pyramid.channels
+        self.baseline_norm = (
+            nn.LayerNorm(deep_channels, eps=1e-6)
+            if backbone_name == "convnext_tiny" else nn.Identity()
+        )
+        self.baseline_classifier = nn.Linear(deep_channels, num_classes)
         self.expert_modules = nn.ModuleDict({
             "texture": TextureExpert(early_channels, proj_dim, branch_depth),
             "morphology": MorphologyExpert(
                 intermediate_channels, proj_dim, branch_depth,
             ),
-            "semantic": SemanticExpert(deep_channels, proj_dim, branch_depth),
             "color": ColorExpert(proj_dim, branch_depth),
             "boundary": BoundaryExpert(early_channels, proj_dim, branch_depth),
         })
@@ -367,16 +448,13 @@ class LesionExpertMoE(nn.Module):
             temperature=router_temperature,
             routing_mode=routing_mode,
         )
-        self.expert_heads = nn.ModuleList([
-            nn.Linear(proj_dim, num_classes) for _ in self.expert_names
-        ])
-        self.head = nn.Sequential(
-            nn.LayerNorm(proj_dim),
-            nn.Dropout(0.35),
-            nn.Linear(proj_dim, 256),
-            nn.SiLU(inplace=True),
-            nn.Dropout(0.25),
-            nn.Linear(256, num_classes),
+        self.head = ComplementaryDeltaHeads(
+            proj_dim, num_classes, len(self.expert_names), dropout=0.25,
+        )
+        # A zero-initialized per-sample gate makes the initial prediction
+        # exactly the baseline while retaining selective correction capacity.
+        self.correction_gate = SelectiveCorrectionGate(
+            num_classes, initial_bias=correction_gate_init,
         )
 
         self.register_buffer(
@@ -386,6 +464,57 @@ class LesionExpertMoE(nn.Module):
             "imagenet_std", torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1),
         )
 
+    def set_training_epoch(self, epoch):
+        self.current_training_epoch = int(epoch)
+
+    def load_baseline_classifier(self, state_dict):
+        """Load the classifier paired with a backbone-only initialization."""
+        if self.backbone_name == "convnext_tiny":
+            norm_keys = ("classifier.0.weight", "classifier.0.bias")
+            linear_keys = ("classifier.3.weight", "classifier.3.bias")
+        elif self.backbone_name.startswith("efficientnet"):
+            norm_keys = None
+            linear_keys = ("classifier.1.weight", "classifier.1.bias")
+        elif self.backbone_name.startswith("resnet"):
+            norm_keys = None
+            linear_keys = ("fc.weight", "fc.bias")
+        elif self.backbone_name == "densenet121":
+            norm_keys = None
+            linear_keys = ("classifier.weight", "classifier.bias")
+        else:
+            return 0
+
+        weight, bias = (state_dict.get(key) for key in linear_keys)
+        if (
+            weight is None or bias is None
+            or weight.shape != self.baseline_classifier.weight.shape
+            or bias.shape != self.baseline_classifier.bias.shape
+        ):
+            return 0
+        with torch.no_grad():
+            self.baseline_classifier.weight.copy_(weight)
+            self.baseline_classifier.bias.copy_(bias)
+            loaded = 2
+            if norm_keys is not None and isinstance(self.baseline_norm, nn.LayerNorm):
+                norm_weight, norm_bias = (state_dict.get(key) for key in norm_keys)
+                if (
+                    norm_weight is not None and norm_bias is not None
+                    and norm_weight.shape == self.baseline_norm.weight.shape
+                    and norm_bias.shape == self.baseline_norm.bias.shape
+                ):
+                    self.baseline_norm.weight.copy_(norm_weight)
+                    self.baseline_norm.bias.copy_(norm_bias)
+                    loaded += 2
+        self.baseline_loaded_flag.fill_(True)
+        return loaded
+
+    def freeze_loaded_baseline(self):
+        if not bool(self.baseline_loaded_flag):
+            return
+        for module in (self.baseline_norm, self.baseline_classifier):
+            for parameter in module.parameters():
+                parameter.requires_grad = False
+
     def _recover_rgb(self, normalized_images):
         return (
             normalized_images * self.imagenet_std + self.imagenet_mean
@@ -394,8 +523,13 @@ class LesionExpertMoE(nn.Module):
     def _structural_auxiliary_loss(self, probabilities, comparison):
         num_experts = probabilities.shape[1]
         mean_usage = probabilities.mean(dim=0)
-        target = torch.full_like(mean_usage, 1.0 / num_experts)
-        balance = (mean_usage - target).square().mean()
+        # KL(mean usage || uniform) strongly penalizes global collapse while
+        # still permitting different samples to choose different experts.
+        balance = (
+            mean_usage * (mean_usage.clamp_min(1e-8).log() + torch.log(
+                mean_usage.new_tensor(float(num_experts))
+            ))
+        ).sum()
 
         similarities = torch.bmm(comparison, comparison.transpose(1, 2))
         mask = ~torch.eye(
@@ -412,10 +546,15 @@ class LesionExpertMoE(nn.Module):
         common_size = intermediate.shape[-2:]
         rgb = self._recover_rgb(x)
 
+        baseline_deep = F.relu(deep) if self.backbone_name == "densenet121" else deep
+        baseline_pooled = F.adaptive_avg_pool2d(baseline_deep, 1).flatten(1)
+        baseline_logits = self.baseline_classifier(
+            self.baseline_norm(baseline_pooled)
+        )
+
         features = [
             self.expert_modules["texture"](early, common_size),
             self.expert_modules["morphology"](intermediate, common_size),
-            self.expert_modules["semantic"](deep, common_size),
             self.expert_modules["color"](rgb, common_size),
             self.expert_modules["boundary"](early, common_size),
         ]
@@ -425,16 +564,35 @@ class LesionExpertMoE(nn.Module):
         ], dim=1)
         weights, probabilities, comparison, disagreement = self.router(pooled)
 
-        fused = sum(
-            weights[:, index, None, None, None] * feature
-            for index, feature in enumerate(features)
+        in_warmup = (
+            self.expert_warmup_epochs > 0
+            and 0 < self.current_training_epoch <= self.expert_warmup_epochs
         )
-        fused_pooled = F.adaptive_avg_pool2d(fused, 1).flatten(1)
-        logits = self.head(fused_pooled)
-        expert_logits = torch.stack([
-            head(pooled[:, index])
-            for index, head in enumerate(self.expert_heads)
-        ], dim=1)
+        if in_warmup:
+            weights = torch.full_like(weights, 1.0 / len(self.expert_names))
+        elif self.training and self.expert_dropout > 0:
+            keep = torch.rand_like(weights) >= self.expert_dropout
+            # Every sample must retain at least one route.
+            empty = ~keep.any(dim=1)
+            if empty.any():
+                keep[empty, probabilities[empty].argmax(dim=1)] = True
+            weights = weights * keep.to(weights.dtype)
+            weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+        expert_delta_logits = self.head(pooled)
+        correction_delta = (
+            weights.unsqueeze(-1) * expert_delta_logits
+        ).sum(dim=1)
+        # The correction path is supervised as a complete prediction during
+        # warm-up even though its contribution to final logits is gated off.
+        correction_logits = baseline_logits + correction_delta
+        correction_scale = self.correction_gate(
+            baseline_logits, disagreement,
+        )
+        if in_warmup:
+            correction_scale = correction_scale * 0.0
+        logits = baseline_logits + correction_scale.unsqueeze(1) * correction_delta
+        expert_logits = baseline_logits.unsqueeze(1) + expert_delta_logits
 
         aux_loss = logits.new_zeros(())
         if self.training:
@@ -445,11 +603,15 @@ class LesionExpertMoE(nn.Module):
         return {
             "logits": logits,
             "expert_logits": expert_logits,
+            "expert_delta_logits": expert_delta_logits,
             "router_weights": weights,
             "router_probabilities": probabilities,
             "router_active": (weights.detach() > 0).to(weights.dtype),
             "expert_embeddings": comparison,
             "expert_disagreement": disagreement,
+            "baseline_logits": baseline_logits,
+            "correction_logits": correction_logits,
+            "correction_scale": correction_scale,
             "aux_loss": aux_loss,
         }
 
@@ -461,7 +623,12 @@ def create_lesion_moe(num_classes=2, pretrained=True, attention=None,
                       router_dropout=0.1, router_temperature=1.0,
                       expert_aux_weight=0.15,
                       expert_diversity_weight=0.01,
-                      router_balance_weight=0.01):
+                      router_balance_weight=0.01,
+                      expert_warmup_epochs=0, expert_dropout=0.0,
+                      correction_aux_weight=0.1,
+                      correction_gate_init=0.0,
+                      router_gain_weight=0.0,
+                      router_gain_temperature=0.25):
     model = LesionExpertMoE(
         backbone_name=backbone1,
         pretrained=pretrained,
@@ -475,5 +642,11 @@ def create_lesion_moe(num_classes=2, pretrained=True, attention=None,
         expert_aux_weight=expert_aux_weight,
         expert_diversity_weight=expert_diversity_weight,
         router_balance_weight=router_balance_weight,
+        expert_warmup_epochs=expert_warmup_epochs,
+        expert_dropout=expert_dropout,
+        correction_aux_weight=correction_aux_weight,
+        correction_gate_init=correction_gate_init,
     )
+    model.router_gain_loss_weight = router_gain_weight
+    model.router_gain_temperature = router_gain_temperature
     return model, "head"
