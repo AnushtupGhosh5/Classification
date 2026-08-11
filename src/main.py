@@ -50,6 +50,7 @@ from src.losses import (
     SymmetricCrossEntropyLoss,
 )
 from src.train import train_model
+from src.utils import calibrate_static_expert_fusion
 from src.evaluate import (
     evaluate_all_splits,
     run_expert_diagnostics,
@@ -305,6 +306,14 @@ def main():
     parser.add_argument("--routing-mode", type=str, default="soft",
                         choices=["soft", "top2", "top1"],
                         help="Sample-level routing mode for lesion_moe")
+    parser.add_argument(
+        "--lesion-fusion-space", type=str, default="logits",
+        choices=["logits", "features"],
+        help=(
+            "Fuse lesion specialists as class-logit corrections or as "
+            "residuals before the one shared semantic classifier"
+        ),
+    )
     parser.add_argument("--expert-aux-weight", type=float, default=0.15,
                         help="Mean auxiliary expert-classifier loss weight")
     parser.add_argument("--expert-diversity-weight", type=float, default=0.01,
@@ -318,6 +327,30 @@ def main():
     parser.add_argument("--oracle-router-version", type=str, default="v1",
                         choices=["v1", "v2", "v3"],
                         help="Oracle router: v1 feature-only, v2 summary/hard, or v3 class-aware/soft routing")
+    parser.add_argument(
+        "--static-fusion-calibration",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Replace the learned sample router at evaluation with a global "
+            "baseline-safe expert mixture selected by validation loss"
+        ),
+    )
+    parser.add_argument(
+        "--static-fusion-alpha-steps", type=int, default=41,
+        help="Number of correction strengths in the validation-loss grid",
+    )
+    parser.add_argument(
+        "--static-fusion-temperatures", type=float, nargs="+",
+        default=(0.01, 0.025, 0.05, 0.1, 0.25, 1.0),
+        help="Reliability-softmax temperatures tried during calibration",
+    )
+    parser.add_argument(
+        "--static-fusion-optimize-weights",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Jointly refine the four global convex expert coefficients",
+    )
     parser.add_argument("--expert-dropout", type=float, default=0.0,
                         help="Probability of masking each expert route during training")
     parser.add_argument("--correction-aux-weight", type=float, default=0.1,
@@ -341,6 +374,10 @@ def main():
                         choices=["shared_base", "multi_layer"],
                         help="Expert mode: shared_base (1 backbone + lightweight branches) or multi_layer (1 backbone, 3 layers)")
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--skip-train-evaluation", action="store_true",
+        help="Skip the expensive full training-split evaluation pass",
+    )
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4,
@@ -403,6 +440,19 @@ def main():
                         help="Enable/disable exponential moving-average evaluation")
     parser.add_argument("--ema-decay", type=float, default=None,
                         help="EMA decay override")
+    parser.add_argument(
+        "--early-stopping", action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable/disable early stopping on validation loss",
+    )
+    parser.add_argument(
+        "--es-patience", type=int, default=15,
+        help="Consecutive validation-loss non-improvements before stopping",
+    )
+    parser.add_argument(
+        "--es-min-delta", type=float, default=0.0,
+        help="Minimum validation-loss decrease counted as improvement",
+    )
     args = parser.parse_args()
 
     config = get_dataset_config(args.dataset)
@@ -504,7 +554,8 @@ def main():
         if args.model in ("lesion_moe", "oracle_moe"):
             print(
                 f"Semantic baseline: {args.backbone1} | Complementary experts: "
-                f"texture/morphology/color/boundary | Routing: {args.routing_mode}"
+                f"texture/morphology/color/boundary | Routing: {args.routing_mode} | "
+                f"Fusion space: {args.lesion_fusion_space}"
             )
         elif args.expert_mode == "multi_layer":
             print(f"Expert mode: multi_layer | Backbone: {args.backbone1}")
@@ -594,6 +645,8 @@ def main():
         if args.model == "oracle_moe":
             residual_kwargs["expert_pretrain_epochs"] = args.expert_pretrain_epochs
             residual_kwargs["oracle_router_version"] = args.oracle_router_version
+        else:
+            residual_kwargs["fusion_space"] = args.lesion_fusion_space
         model, head_name = residual_factory(**residual_kwargs)
     elif is_expert_fusion:
         expert_kwargs = dict(
@@ -722,6 +775,22 @@ def main():
                     "the residual baseline head will be learned from scratch"
                 )
 
+    def restore_protected_baseline():
+        """Reapply the exact source baseline after loading a fusion checkpoint.
+
+        EMA and checkpoint serialization can otherwise introduce tiny drift in
+        nominally frozen tensors. A protected residual model must retain the
+        exact reference classifier for a valid baseline comparison.
+        """
+        if not (
+            args.protect_baseline
+            and args.backbone_init_checkpoint
+            and hasattr(model, "load_baseline_classifier")
+        ):
+            return
+        target.load_state_dict(compatible, strict=False)
+        model.load_baseline_classifier(source_state)
+
     classifier_dropout = override_default("classifier_dropout")
     head = getattr(model, head_name)
     dropout_layers = [module for module in head.modules() if isinstance(module, nn.Dropout)]
@@ -820,6 +889,9 @@ def main():
     mix_prob = override_default("mix_prob")
     eval_tta = override_default("tta")
     calibrate_binary = override_default("calibrate_binary")
+    early_stopping = override_default("early_stopping")
+    es_patience = override_default("es_patience")
+    es_min_delta = override_default("es_min_delta")
     if not 0.0 <= mix_prob <= 1.0:
         parser.error("--mix-prob must be between 0 and 1")
     if mix_prob > 0 and mixup_alpha <= 0 and cutmix_alpha <= 0:
@@ -837,6 +909,10 @@ def main():
         parser.error("--router-temperature must be positive")
     if args.router_lr_scale <= 0:
         parser.error("--router-lr-scale must be positive")
+    if es_patience < 1:
+        parser.error("--es-patience must be positive")
+    if es_min_delta < 0:
+        parser.error("--es-min-delta must be non-negative")
     if any(value < 0 for value in (
         args.load_balance_weight,
         args.diversity_weight,
@@ -929,9 +1005,9 @@ def main():
             monitor_mode=monitor_mode,
             scheduler_factor=scheduler_factor,
             scheduler_patience=scheduler_patience,
-            early_stopping=overrides.get("early_stopping", False),
-            es_patience=overrides.get("es_patience", 15),
-            es_min_delta=overrides.get("es_min_delta", 0.0),
+            early_stopping=early_stopping,
+            es_patience=es_patience,
+            es_min_delta=es_min_delta,
             ema=ema_enabled,
             ema_decay=ema_decay,
             grad_clip=overrides.get("grad_clip", None),
@@ -965,6 +1041,7 @@ def main():
         model.load_state_dict(torch.load(
             router_best_path, map_location=device, weights_only=True,
         ))
+        restore_protected_baseline()
         run_oracle_diagnostics(
             # The official test split is never used for oracle/expert
             # diagnostics. It is reserved for the locked learned model below.
@@ -976,9 +1053,47 @@ def main():
     if os.path.exists(best_model_path):
         print(f"\nLoading best model from {best_model_path}")
         model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
+        restore_protected_baseline()
+
+    if args.static_fusion_calibration:
+        calibration = calibrate_static_expert_fusion(
+            model, val_loader, criterion, device, num_classes, tta=eval_tta,
+            alpha_steps=args.static_fusion_alpha_steps,
+            temperatures=args.static_fusion_temperatures,
+            optimize_weights=args.static_fusion_optimize_weights,
+        )
+        os.makedirs(results_dir, exist_ok=True)
+        calibration_path = os.path.join(
+            results_dir, f"{model_label}_static_fusion_calibration.json",
+        )
+        with open(calibration_path, "w") as file:
+            json.dump(calibration, file, indent=2)
+        baseline = calibration["baseline"]
+        calibrated = calibration["calibrated_static_fusion"]
+        weights = ", ".join(
+            f"{name}={value:.3f}"
+            for name, value in calibration["expert_weights"].items()
+        )
+        print("\nVALIDATION-LOSS STATIC FUSION CALIBRATION:")
+        print(
+            f"  baseline   loss={baseline['loss']:.4f} | "
+            f"Acc={baseline['accuracy']:.4f} | F1={baseline['f1']:.4f}"
+        )
+        print(
+            f"  calibrated loss={calibrated['loss']:.4f} | "
+            f"Acc={calibrated['accuracy']:.4f} | F1={calibrated['f1']:.4f}"
+        )
+        print(
+            f"  alpha={calibration['alpha']:.3f} | "
+            f"temperature={calibration['temperature']:.3g} | "
+            f"optimizer={calibration['fusion_optimizer']} | {weights}"
+        )
+        print(f"Saved static-fusion calibration: {calibration_path}")
 
     final_results = evaluate_all_splits(
-        model, train_eval_loader, val_loader, evaluation_test_loader,
+        model,
+        None if args.skip_train_evaluation else train_eval_loader,
+        val_loader, evaluation_test_loader,
         criterion, device, num_classes, tta=eval_tta,
     )
 

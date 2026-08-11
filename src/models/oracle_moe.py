@@ -304,7 +304,45 @@ class OracleResidualMoE(LesionExpertMoE):
             raise ValueError(
                 f"Unknown oracle router version: {oracle_router_version}"
             )
+        # Non-persistent inference buffers keep old checkpoints compatible.
+        # They are fitted deterministically on validation logits and recorded
+        # in a separate JSON artifact, never learned from the official test.
+        self.register_buffer(
+            "static_expert_weights",
+            torch.full((len(self.expert_names),), 1.0 / len(self.expert_names)),
+            persistent=False,
+        )
+        self.register_buffer(
+            "static_correction_alpha", torch.tensor(0.0), persistent=False,
+        )
+        self._static_fusion_enabled = False
         self._oracle_phase = "expert"
+
+    def configure_static_fusion(self, alpha, expert_weights):
+        """Use a global baseline-safe residual mixture at inference.
+
+        ``alpha=0`` reproduces the protected semantic baseline exactly.
+        Expert weights are normalized here so malformed configuration cannot
+        silently amplify the correction.
+        """
+        weights = torch.as_tensor(
+            expert_weights,
+            device=self.static_expert_weights.device,
+            dtype=self.static_expert_weights.dtype,
+        )
+        if weights.numel() != len(self.expert_names):
+            raise ValueError(
+                f"Expected {len(self.expert_names)} expert weights, got "
+                f"{weights.numel()}"
+            )
+        weights = weights.clamp_min(0)
+        weights = weights / weights.sum().clamp_min(1e-8)
+        self.static_expert_weights.copy_(weights)
+        self.static_correction_alpha.fill_(float(max(0.0, min(1.0, alpha))))
+        self._static_fusion_enabled = True
+
+    def clear_static_fusion(self):
+        self._static_fusion_enabled = False
 
     @staticmethod
     def _set_module_trainable(module, trainable):
@@ -395,6 +433,22 @@ class OracleResidualMoE(LesionExpertMoE):
             correction_weights = probabilities[:, 1:]
             logits = baseline_logits
             correction_scale = torch.zeros_like(probabilities[:, 0])
+        elif self._static_fusion_enabled:
+            alpha = self.static_correction_alpha.to(expert_delta_logits)
+            static_weights = self.static_expert_weights.to(
+                expert_delta_logits,
+            ).unsqueeze(0).expand(expert_delta_logits.size(0), -1)
+            correction_weights = alpha * static_weights
+            probabilities = torch.cat((
+                (1.0 - alpha).expand(expert_delta_logits.size(0), 1),
+                correction_weights,
+            ), dim=1)
+            routed_delta = (
+                correction_weights.unsqueeze(-1) * expert_delta_logits
+            ).sum(dim=1)
+            logits = baseline_logits + routed_delta
+            correction_scale = alpha.expand(expert_delta_logits.size(0))
+            router_logits = probabilities.clamp_min(1e-8).log()
         else:
             routed_delta = (
                 correction_weights.unsqueeze(-1) * expert_delta_logits

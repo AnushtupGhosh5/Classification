@@ -240,15 +240,24 @@ def run_test_evaluation(model, test_loader, class_names, num_classes, device,
     features, feat_labels = extract_features(model, test_loader, device, head_name)
     plot_tsne(features, feat_labels, class_names, save_dir, model_label)
 
-    if is_expert_fusion:
-        visualize_gradcam_per_expert(
-            model, test_loader, device, save_dir, model_label,
-            num_images=4, class_names=class_names,
-        )
-    else:
-        visualize_gradcam(
-            model, test_loader, device, save_dir, model_label,
-            num_images=8, model_name=model_name, class_names=class_names,
+    try:
+        if is_expert_fusion:
+            visualize_gradcam_per_expert(
+                model, test_loader, device, save_dir, model_label,
+                num_images=4, class_names=class_names,
+            )
+        else:
+            visualize_gradcam(
+                model, test_loader, device, save_dir, model_label,
+                num_images=8, model_name=model_name, class_names=class_names,
+            )
+    except Exception as error:
+        # Interpretability plots are optional post-hoc artifacts. A plotting
+        # incompatibility must not discard already-computed test metrics or
+        # prevent their CSV/history persistence.
+        print(
+            "GradCAM generation failed; metrics remain valid and will still "
+            f"be saved. Error: {error}"
         )
 
     metrics["macro_auc"] = round(macro_auc, 4)

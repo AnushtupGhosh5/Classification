@@ -24,6 +24,10 @@ _PYRAMID_TARGETS = {
     "efficientnet_b0": (("features", "2"), ("features", "5"), ("features", "8")),
     "efficientnet_b1": (("features", "2"), ("features", "5"), ("features", "8")),
     "efficientnet_b2": (("features", "2"), ("features", "5"), ("features", "8")),
+    # EfficientNet-V2-S has eight feature stages (0..7). Stage 2 retains the
+    # 1/4-resolution detail map, stage 5 is the last 1/16 map, and stage 7 is
+    # the final 1280-channel representation.
+    "efficientnet_v2_s": (("features", "2"), ("features", "5"), ("features", "7")),
     "convnext_tiny": (("features", "1"), ("features", "5"), ("features", "7")),
     "resnet34": (("layer1",), ("layer2",), ("layer4",)),
     "resnet50": (("layer1",), ("layer2",), ("layer4",)),
@@ -357,6 +361,31 @@ class ComplementaryDeltaHeads(nn.Module):
         ], dim=1)
 
 
+class ComplementaryFeatureAdapters(nn.Module):
+    """Map specialist descriptors into the shared semantic feature space.
+
+    These are lightweight adapters, not additional classifiers or backbones.
+    Every routed correction is consumed by the one baseline classifier.
+    """
+
+    def __init__(self, proj_dim, semantic_dim, num_experts):
+        super().__init__()
+        self.adapters = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(proj_dim),
+                nn.Linear(proj_dim, semantic_dim, bias=False),
+                nn.LayerNorm(semantic_dim),
+            )
+            for _ in range(num_experts)
+        ])
+
+    def forward(self, pooled):
+        return torch.stack([
+            adapter(pooled[:, index])
+            for index, adapter in enumerate(self.adapters)
+        ], dim=1)
+
+
 class SelectiveCorrectionGate(nn.Module):
     """Per-sample gate from baseline uncertainty and expert disagreement."""
 
@@ -402,6 +431,7 @@ class LesionExpertMoE(nn.Module):
 
     def __init__(self, backbone_name="efficientnet_b0", pretrained=True,
                  proj_dim=128, num_classes=7, branch_depth=1,
+                 fusion_space="logits",
                  routing_mode="soft", router_hidden=128,
                  router_dropout=0.1, router_temperature=1.0,
                  expert_aux_weight=0.15, expert_diversity_weight=0.01,
@@ -427,6 +457,9 @@ class LesionExpertMoE(nn.Module):
         self.router_gain_loss_weight = 0.0
         self.router_gain_temperature = 0.25
         self.backbone_name = backbone_name
+        if fusion_space not in ("logits", "features"):
+            raise ValueError(f"Unknown lesion-MoE fusion space: {fusion_space}")
+        self.fusion_space = fusion_space
         # Persistent because the correction ramp is part of the model selected
         # by validation loss. Reloading a checkpoint must reproduce the exact
         # correction strength used in that validation epoch.
@@ -460,9 +493,14 @@ class LesionExpertMoE(nn.Module):
             temperature=router_temperature,
             routing_mode=routing_mode,
         )
-        self.head = ComplementaryDeltaHeads(
-            proj_dim, num_classes, len(self.expert_names), dropout=0.25,
-        )
+        if self.fusion_space == "features":
+            self.head = ComplementaryFeatureAdapters(
+                proj_dim, deep_channels, len(self.expert_names),
+            )
+        else:
+            self.head = ComplementaryDeltaHeads(
+                proj_dim, num_classes, len(self.expert_names), dropout=0.25,
+            )
         # A zero-initialized per-sample gate makes the initial prediction
         # exactly the baseline while retaining selective correction capacity.
         self.correction_gate = SelectiveCorrectionGate(
@@ -569,9 +607,8 @@ class LesionExpertMoE(nn.Module):
 
         baseline_deep = F.relu(deep) if self.backbone_name == "densenet121" else deep
         baseline_pooled = F.adaptive_avg_pool2d(baseline_deep, 1).flatten(1)
-        baseline_logits = self.baseline_classifier(
-            self.baseline_norm(baseline_pooled)
-        )
+        semantic_feature = self.baseline_norm(baseline_pooled)
+        baseline_logits = self.baseline_classifier(semantic_feature)
 
         features = [
             self.expert_modules["texture"](early, common_size),
@@ -600,13 +637,6 @@ class LesionExpertMoE(nn.Module):
             weights = weights * keep.to(weights.dtype)
             weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
 
-        expert_delta_logits = self.head(pooled)
-        correction_delta = (
-            weights.unsqueeze(-1) * expert_delta_logits
-        ).sum(dim=1)
-        # The correction path is supervised as a complete prediction during
-        # warm-up even though its contribution to final logits is gated off.
-        correction_logits = baseline_logits + correction_delta
         correction_scale = self.correction_gate(
             baseline_logits, disagreement,
         )
@@ -622,8 +652,47 @@ class LesionExpertMoE(nn.Module):
                 )
                 correction_scale = correction_scale * ramp
             correction_scale = correction_scale * self.correction_max_scale
-        logits = baseline_logits + correction_scale.unsqueeze(1) * correction_delta
-        expert_logits = baseline_logits.unsqueeze(1) + expert_delta_logits
+        if self.fusion_space == "features":
+            expert_residuals = self.head(pooled)
+            # Preserve the semantic feature's natural scale across ConvNeXt,
+            # EfficientNet, and ResNet while adapters remain normalized.
+            semantic_rms = semantic_feature.detach().square().mean(
+                dim=1, keepdim=True,
+            ).add(1e-6).sqrt()
+            expert_residuals = expert_residuals * semantic_rms.unsqueeze(1)
+            routed_residual = (
+                weights.unsqueeze(-1) * expert_residuals
+            ).sum(dim=1)
+            fused_feature = (
+                semantic_feature
+                + correction_scale.unsqueeze(1) * routed_residual
+            )
+            logits = self.baseline_classifier(fused_feature)
+            expert_logits = torch.stack([
+                self.baseline_classifier(
+                    semantic_feature + expert_residuals[:, index]
+                )
+                for index in range(expert_residuals.size(1))
+            ], dim=1)
+            uniform_residual = expert_residuals.mean(dim=1)
+            correction_logits = self.baseline_classifier(
+                semantic_feature + correction_scale.unsqueeze(1)
+                * uniform_residual
+            )
+            expert_delta_logits = expert_logits - baseline_logits.unsqueeze(1)
+        else:
+            expert_delta_logits = self.head(pooled)
+            correction_delta = (
+                weights.unsqueeze(-1) * expert_delta_logits
+            ).sum(dim=1)
+            # The correction path is supervised as a complete prediction
+            # during warm-up even though final contribution is gated off.
+            correction_logits = baseline_logits + correction_delta
+            logits = (
+                baseline_logits
+                + correction_scale.unsqueeze(1) * correction_delta
+            )
+            expert_logits = baseline_logits.unsqueeze(1) + expert_delta_logits
 
         aux_loss = logits.new_zeros(())
         if self.training:
@@ -650,6 +719,7 @@ class LesionExpertMoE(nn.Module):
 def create_lesion_moe(num_classes=2, pretrained=True, attention=None,
                       backbone1="efficientnet_b0", backbone2=None,
                       backbone3=None, proj_dim=128, branch_depth=1,
+                      fusion_space="logits",
                       routing_mode="soft", router_hidden=128,
                       router_dropout=0.1, router_temperature=1.0,
                       expert_aux_weight=0.15,
@@ -671,6 +741,7 @@ def create_lesion_moe(num_classes=2, pretrained=True, attention=None,
         proj_dim=proj_dim,
         num_classes=num_classes,
         branch_depth=branch_depth,
+        fusion_space=fusion_space,
         routing_mode=routing_mode,
         router_hidden=router_hidden,
         router_dropout=router_dropout,

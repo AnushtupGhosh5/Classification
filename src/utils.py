@@ -474,6 +474,188 @@ def compute_oracle_diagnostics(model, dataloader, criterion, device,
 
 
 @torch.no_grad()
+def calibrate_static_expert_fusion(
+    model, dataloader, criterion, device, num_classes, tta=False,
+    alpha_steps=41, temperatures=(0.01, 0.025, 0.05, 0.1, 0.25, 1.0),
+    optimize_weights=True,
+):
+    """Fit a low-variance residual expert mixture on validation loss.
+
+    Each temperature converts the standalone validation-loss improvements of
+    the four experts into one global reliability distribution. A one-
+    dimensional grid then selects the residual strength. The grid contains
+    alpha=0, which is the protected semantic baseline exactly. Selection is
+    strictly by minimum validation loss; accuracy is reported only afterward.
+    """
+    if not hasattr(model, "configure_static_fusion"):
+        raise ValueError(
+            "Static expert calibration requires a baseline-preserving "
+            "residual expert model."
+        )
+    if alpha_steps < 2:
+        raise ValueError("alpha_steps must be at least 2")
+    temperatures = tuple(float(value) for value in temperatures)
+    if not temperatures or any(value <= 0 for value in temperatures):
+        raise ValueError("All static-fusion temperatures must be positive")
+
+    model.eval()
+    baseline_batches = []
+    expert_batches = []
+    label_batches = []
+    for images, labels in dataloader:
+        images = images.to(device)
+        _, _, details = _forward_with_tta_details(model, images, tta=tta)
+        if (
+            details.get("baseline_logits") is None
+            or details.get("expert_logits") is None
+        ):
+            raise ValueError("Model did not expose baseline/expert logits")
+        baseline_batches.append(details["baseline_logits"].cpu())
+        expert_batches.append(details["expert_logits"].cpu())
+        label_batches.append(labels.cpu())
+    if not label_batches:
+        raise ValueError("Cannot calibrate static fusion on an empty loader")
+
+    baseline = torch.cat(baseline_batches)
+    experts = torch.cat(expert_batches)
+    labels = torch.cat(label_batches)
+    deltas = experts - baseline.unsqueeze(1)
+
+    weight = None
+    label_smoothing = 0.0
+    if isinstance(criterion, nn.CrossEntropyLoss):
+        if criterion.weight is not None:
+            weight = criterion.weight.detach().cpu()
+        label_smoothing = criterion.label_smoothing
+
+    def aggregate_loss(logits):
+        losses = F.cross_entropy(
+            logits, labels, weight=weight, reduction="none",
+            label_smoothing=label_smoothing,
+        )
+        if weight is not None:
+            return losses.sum() / weight[labels].sum().clamp_min(1e-8)
+        return losses.mean()
+
+    def report(logits):
+        values = compute_metrics(
+            labels.numpy(), logits.argmax(dim=1).numpy(), num_classes,
+        )
+        values["loss"] = round(float(aggregate_loss(logits)), 6)
+        return values
+
+    baseline_loss = aggregate_loss(baseline)
+    expert_losses = torch.stack([
+        aggregate_loss(experts[:, index])
+        for index in range(experts.size(1))
+    ])
+    # Dimensionless positive improvements make the temperature grid portable
+    # across binary and multiclass criteria. Experts worse than the baseline
+    # receive no positive evidence, but remain available at high temperature.
+    relative_gains = (
+        (baseline_loss - expert_losses) / baseline_loss.abs().clamp_min(1e-8)
+    ).clamp_min(0.0)
+
+    best = None
+    for temperature in temperatures:
+        reliability = torch.softmax(relative_gains / temperature, dim=0)
+        correction = (
+            reliability.view(1, -1, 1) * deltas
+        ).sum(dim=1)
+        for alpha_tensor in torch.linspace(0.0, 1.0, alpha_steps):
+            alpha = float(alpha_tensor)
+            logits = baseline + alpha * correction
+            loss = float(aggregate_loss(logits))
+            # Deterministic tie-break: prefer the smaller correction, then the
+            # smoother (higher-temperature) reliability distribution.
+            key = (loss, alpha, -temperature)
+            if best is None or key < best["key"]:
+                best = {
+                    "key": key,
+                    "loss": loss,
+                    "alpha": alpha,
+                    "temperature": temperature,
+                    "weights": reliability.clone(),
+                    "logits": logits.clone(),
+                    "optimizer": "reliability_grid",
+                }
+
+    # Jointly refine the same global mixture. This remains a four-effective-
+    # parameter convex residual (one simplex over specialists plus its total
+    # strength), not a sample router. Starting from the reliability solution
+    # makes the optimization deterministic and LBFGS avoids another LR knob.
+    if optimize_weights:
+        initial_alpha = min(max(best["alpha"], 1e-4), 1.0 - 1e-4)
+        alpha_logit = torch.tensor(
+            np.log(initial_alpha / (1.0 - initial_alpha)),
+            dtype=baseline.dtype, requires_grad=True,
+        )
+        weight_logits = best["weights"].clamp_min(1e-8).log().detach().clone()
+        weight_logits.requires_grad_(True)
+        optimizer = torch.optim.LBFGS(
+            (alpha_logit, weight_logits),
+            lr=1.0, max_iter=100, tolerance_grad=1e-9,
+            tolerance_change=1e-10, line_search_fn="strong_wolfe",
+        )
+
+        def closure():
+            optimizer.zero_grad()
+            alpha = torch.sigmoid(alpha_logit)
+            weights = torch.softmax(weight_logits, dim=0)
+            correction = (weights.view(1, -1, 1) * deltas).sum(dim=1)
+            loss = aggregate_loss(baseline + alpha * correction)
+            loss.backward()
+            return loss
+
+        with torch.enable_grad():
+            optimizer.step(closure)
+        optimized_alpha = float(torch.sigmoid(alpha_logit).detach())
+        optimized_weights = torch.softmax(
+            weight_logits.detach(), dim=0,
+        )
+        optimized_logits = baseline + optimized_alpha * (
+            optimized_weights.view(1, -1, 1) * deltas
+        ).sum(dim=1)
+        optimized_loss = float(aggregate_loss(optimized_logits))
+        optimized_key = (
+            optimized_loss, optimized_alpha, -best["temperature"],
+        )
+        if optimized_key < best["key"]:
+            best.update({
+                "key": optimized_key,
+                "loss": optimized_loss,
+                "alpha": optimized_alpha,
+                "weights": optimized_weights,
+                "logits": optimized_logits,
+                "optimizer": "joint_convex_lbfgs",
+            })
+
+    model.configure_static_fusion(best["alpha"], best["weights"])
+    expert_names = list(getattr(model, "expert_names", ()))
+    if len(expert_names) != experts.size(1):
+        expert_names = [f"expert{index}" for index in range(experts.size(1))]
+    calibration = {
+        "selection_metric": "minimum_validation_loss",
+        "num_validation_samples": int(labels.numel()),
+        "alpha": round(best["alpha"], 6),
+        "temperature": best["temperature"],
+        "fusion_optimizer": best["optimizer"],
+        "expert_weights": {
+            name: round(float(best["weights"][index]), 8)
+            for index, name in enumerate(expert_names)
+        },
+        "expert_relative_loss_gains": {
+            name: round(float(relative_gains[index]), 8)
+            for index, name in enumerate(expert_names)
+        },
+        "baseline": report(baseline),
+        "uniform_full_correction": report(baseline + deltas.mean(dim=1)),
+        "calibrated_static_fusion": report(best["logits"]),
+    }
+    return calibration
+
+
+@torch.no_grad()
 def extract_features(model, dataloader, device, head_name="classifier"):
     model.eval()
     all_features = []

@@ -131,7 +131,11 @@ def visualize_gradcam(
     model.eval()
     with torch.no_grad():
         preds_list = wrapped(images_tensor).argmax(dim=1).cpu().tolist()
-    cams_list = cam(input_tensor=images_tensor)
+    # A protected/frozen backbone has no trainable parameters. Grad-CAM still
+    # needs an autograd path to its target activations, so explicitly request
+    # gradients with respect to the visualization input.
+    cam_input = images_tensor.detach().requires_grad_(True)
+    cams_list = cam(input_tensor=cam_input)
 
     cols = min(4, len(images_list))
     rows = (len(images_list) + cols - 1) // cols
@@ -247,7 +251,13 @@ def visualize_gradcam_per_expert(
                 continue
 
             cam_obj = _GradCAM(model=wrapped, target_layers=[target])
-            grayscale_cam = cam_obj(input_tensor=images_batch[i : i + 1])
+            # Expert parameters are intentionally frozen in router phase and
+            # in the selected checkpoint. Input gradients keep Grad-CAM valid
+            # without unfreezing or modifying the trained model.
+            cam_input = (
+                images_batch[i : i + 1].detach().requires_grad_(True)
+            )
+            grayscale_cam = cam_obj(input_tensor=cam_input)
             cam_img = show_cam_on_image(img_np, grayscale_cam[0], use_rgb=True)
 
             axes[i, j + 1].imshow(cam_img)
