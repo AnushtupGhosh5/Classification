@@ -1,41 +1,40 @@
 #!/bin/bash
+set -e
 
-# Stabilized ConvNeXt residual-MoE experiment. The pretrained semantic path is
-# immutable throughout training. During warm-up the output exactly follows the
-# baseline while texture/morphology/color/boundary corrections learn. Stage 2
-# ramps a capped correction and distils toward the baseline to prevent the
-# runaway correction observed in v3.
-# These are intentionally explicit: change loss/lr/img-size/etc. here when
-# running an experiment. Command-line values take precedence over dataset
-# defaults in src/data/dataset_config.py.
+# MILK10k class-aware oracle-router-v3 validation experiment. The 73.41% test-accuracy
+# ConvNeXt-Tiny run supplies the immutable semantic baseline. Phase 1 trains
+# only the four correction experts; phase 2 freezes them and trains only the
+# router. V3 preserves all 11 class probabilities and distils soft oracle gains
+# instead of collapsing them into hard route labels. The official test is not
+# evaluated while this configuration is being developed.
 #
 python src/main.py \
     --output-dir outputs \
-    --run-name milk10k_complementary_residual_moe_convnext_v4 \
+    --run-name milk10k_oracle_router_v3_convnext_256_v1 \
     --dataset milk10k \
-    --model lesion_moe \
+    --model oracle_moe \
     --backbone1 convnext_tiny \
     --backbone-init-checkpoint outputs/models/milk10k/convnext_tiny_milk10k_b0_safe_recipe_v1/convnext_tiny_milk10k_b0_safe_recipe_v1_best.pth \
     --proj-dim 128 \
     --branch-depth 1 \
     --routing-mode soft \
     --router-hidden 128 \
-    --router-dropout 0.15 \
+    --router-dropout 0.10 \
     --router-temperature 1.0 \
+    --router-lr-scale 0.25 \
     --expert-aux-weight 0.20 \
     --expert-diversity-weight 0 \
-    --router-balance-weight 0.01 \
-    --expert-warmup-epochs 5 \
+    --router-balance-weight 0 \
+    --expert-pretrain-epochs 10 \
+    --oracle-router-version v3 \
+    --expert-warmup-epochs 10 \
     --expert-dropout 0 \
     --correction-aux-weight 0.10 \
-    --correction-gate-init 0 \
     --protect-baseline \
-    --correction-max-scale 0.20 \
-    --correction-ramp-epochs 10 \
-    --residual-distill-weight 0.10 \
-    --router-gain-weight 0.20 \
+    --residual-distill-weight 0.05 \
+    --router-gain-weight 0.25 \
     --router-gain-temperature 0.25 \
-    --epochs 50 \
+    --epochs 35 \
     --batch-size 16 \
     --img-size 256 \
     --loss ce \
@@ -43,18 +42,17 @@ python src/main.py \
     --weight-decay 0.0001 \
     --scheduler cosine \
     --label-smoothing 0.05 \
-    --freeze-epochs 5 \
+    --freeze-epochs 10 \
     --augment-style skin_focus \
     --weighted-sampler \
     --sampler-mode sqrt \
     --class-weight-power 0.25 \
-    --mixup-alpha 0.1 \
-    --cutmix-alpha 0 \
-    --mix-prob 0.15 \
-    --classifier-dropout 0.35 \
+    --mix-prob 0 \
+    --classifier-dropout 0.25 \
     --ema \
-    --ema-decay 0.99 \
+    --ema-decay 0.999 \
     --tta \
+    --validation-only \
     --amp
 
 # Earlier EfficientNet-B0 command retained only as a parameter reference. The

@@ -41,6 +41,7 @@ from src.models.caef import create_caef
 from src.models.mief import create_mief
 from src.models.moe_edf import create_moe_edf
 from src.models.lesion_moe import create_lesion_moe
+from src.models.oracle_moe import create_oracle_moe
 from src.losses import (
     FocalLoss,
     SEEFNetCEFocalLoss,
@@ -52,6 +53,7 @@ from src.train import train_model
 from src.evaluate import (
     evaluate_all_splits,
     run_expert_diagnostics,
+    run_oracle_diagnostics,
     run_test_evaluation,
 )
 from src.visualize import plot_training_curves
@@ -82,6 +84,7 @@ MODEL_REGISTRY = {
     "mief": create_mief,
     "moe_edf": create_moe_edf,
     "lesion_moe": create_lesion_moe,
+    "oracle_moe": create_oracle_moe,
 }
 
 ATTENTION_CHOICES = ["none", "se", "cbam", "eca"]
@@ -292,6 +295,8 @@ def main():
     parser.add_argument("--router-hidden", type=int, default=128)
     parser.add_argument("--router-dropout", type=float, default=0.1)
     parser.add_argument("--router-temperature", type=float, default=1.0)
+    parser.add_argument("--router-lr-scale", type=float, default=1.0,
+                        help="Router learning rate as a multiplier of --lr")
     parser.add_argument("--disagreement-scale", type=float, default=1.0)
     parser.add_argument("--load-balance-weight", type=float, default=0.01)
     parser.add_argument("--diversity-weight", type=float, default=0.01)
@@ -308,6 +313,11 @@ def main():
                         help="Batch-level router load-balancing loss weight")
     parser.add_argument("--expert-warmup-epochs", type=int, default=0,
                         help="Epochs of uniform routing and zero MoE correction")
+    parser.add_argument("--expert-pretrain-epochs", type=int, default=10,
+                        help="Frozen-baseline expert-only epochs for oracle_moe")
+    parser.add_argument("--oracle-router-version", type=str, default="v1",
+                        choices=["v1", "v2", "v3"],
+                        help="Oracle router: v1 feature-only, v2 summary/hard, or v3 class-aware/soft routing")
     parser.add_argument("--expert-dropout", type=float, default=0.0,
                         help="Probability of masking each expert route during training")
     parser.add_argument("--correction-aux-weight", type=float, default=0.1,
@@ -354,7 +364,7 @@ def main():
     parser.add_argument("--partial-init", action="store_true",
                         help="Allow missing/new model keys when loading --init-checkpoint")
     parser.add_argument("--backbone-init-checkpoint", type=str, default="",
-                        help="Initialize only a fusion model's shared backbone")
+                        help="Initialize backbone weights from a plain or nested fusion checkpoint")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--amp", action="store_true",
@@ -373,6 +383,11 @@ def main():
                         help="Average identity and flip predictions for validation/test")
     parser.add_argument("--calibrate-binary", action=argparse.BooleanOptionalAction, default=False,
                         help="Select binary probability threshold on validation accuracy")
+    parser.add_argument("--validation-only", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="Defer all official-test evaluation and report validation only")
+    parser.add_argument("--evaluate-only", action="store_true",
+                        help="Load this run's existing minimum-validation-loss checkpoint and evaluate without retraining")
     parser.add_argument("--augment-style", type=str, default=None,
                         choices=["balanced", "seefnet", "skin", "skin_focus"],
                         help="Override the dataset's image augmentation policy")
@@ -478,7 +493,7 @@ def main():
     is_vit = args.model in VIT_MODELS
     is_dual_fusion = args.model == "dual_fusion"
     is_expert_fusion = args.model in (
-        "cef", "edf", "caef", "mief", "moe_edf", "lesion_moe",
+        "cef", "edf", "caef", "mief", "moe_edf", "lesion_moe", "oracle_moe",
     )
     print(
         f"\nModel: {args.model} | Attention: {args.attention} | "
@@ -486,7 +501,7 @@ def main():
         f"Image size: {img_size}"
     )
     if is_expert_fusion:
-        if args.model == "lesion_moe":
+        if args.model in ("lesion_moe", "oracle_moe"):
             print(
                 f"Semantic baseline: {args.backbone1} | Complementary experts: "
                 f"texture/morphology/color/boundary | Routing: {args.routing_mode}"
@@ -508,11 +523,12 @@ def main():
                 f"dropout={args.router_dropout}, "
                 f"temperature={args.router_temperature}"
             )
-        elif args.model == "lesion_moe":
+        elif args.model in ("lesion_moe", "oracle_moe"):
             print(
                 f"Router: hidden={args.router_hidden}, "
                 f"dropout={args.router_dropout}, "
-                f"temperature={args.router_temperature} | "
+                f"temperature={args.router_temperature}, "
+                f"lr_scale={args.router_lr_scale} | "
                 f"Aux/diversity/balance={args.expert_aux_weight}/"
                 f"{args.expert_diversity_weight}/{args.router_balance_weight}"
             )
@@ -526,7 +542,8 @@ def main():
                 f"ramp={args.correction_ramp_epochs} | "
                 f"distill={args.residual_distill_weight} | "
                 f"router_gain={args.router_gain_weight}@"
-                f"{args.router_gain_temperature}"
+                f"{args.router_gain_temperature} | "
+                f"oracle_router={args.oracle_router_version}"
             )
         print(f"Projection dim: {args.proj_dim}")
         print(f"Branch depth: {args.branch_depth} residual blocks")
@@ -543,8 +560,12 @@ def main():
     use_imagenet_pretrained = not bool(
         args.init_checkpoint or args.backbone_init_checkpoint
     )
-    if args.model == "lesion_moe":
-        model, head_name = create_lesion_moe(
+    if args.model in ("lesion_moe", "oracle_moe"):
+        residual_factory = (
+            create_oracle_moe if args.model == "oracle_moe"
+            else create_lesion_moe
+        )
+        residual_kwargs = dict(
             num_classes=num_classes,
             pretrained=use_imagenet_pretrained,
             attention=attention_arg,
@@ -555,6 +576,7 @@ def main():
             router_hidden=args.router_hidden,
             router_dropout=args.router_dropout,
             router_temperature=args.router_temperature,
+            router_lr_scale=args.router_lr_scale,
             expert_aux_weight=args.expert_aux_weight,
             expert_diversity_weight=args.expert_diversity_weight,
             router_balance_weight=args.router_balance_weight,
@@ -569,6 +591,10 @@ def main():
             router_gain_weight=args.router_gain_weight,
             router_gain_temperature=args.router_gain_temperature,
         )
+        if args.model == "oracle_moe":
+            residual_kwargs["expert_pretrain_epochs"] = args.expert_pretrain_epochs
+            residual_kwargs["oracle_router_version"] = args.oracle_router_version
+        model, head_name = residual_factory(**residual_kwargs)
     elif is_expert_fusion:
         expert_kwargs = dict(
             num_classes=num_classes,
@@ -640,26 +666,47 @@ def main():
             )
         backbone_name = getattr(model, "_backbone_module_name", None)
         if backbone_name is None:
-            parser.error("--backbone-init-checkpoint requires a fusion model")
-        backbone_container = getattr(model, backbone_name)
-        target = getattr(backbone_container, "backbone", backbone_container)
+            # A regular classifier can be warm-started from the backbone
+            # embedded in an earlier fusion checkpoint. Its newly created
+            # classifier remains untouched and is trained normally.
+            target = model
+            excluded_prefix = f"{head_name}."
+        else:
+            backbone_container = getattr(model, backbone_name)
+            target = getattr(backbone_container, "backbone", backbone_container)
+            excluded_prefix = None
         source_state = torch.load(
             args.backbone_init_checkpoint,
             map_location=device,
             weights_only=True,
         )
         target_state = target.state_dict()
-        compatible = {
-            key: value for key, value in source_state.items()
-            if key in target_state and target_state[key].shape == value.shape
-        }
+        source_prefixes = (
+            "",
+            "feature_pyramid.extractor.backbone.",
+            "extractor.backbone.",
+        )
+        compatible = {}
+        for source_key, value in source_state.items():
+            for prefix in source_prefixes:
+                if prefix and not source_key.startswith(prefix):
+                    continue
+                target_key = source_key[len(prefix):] if prefix else source_key
+                if excluded_prefix and target_key.startswith(excluded_prefix):
+                    continue
+                if (
+                    target_key in target_state
+                    and target_state[target_key].shape == value.shape
+                ):
+                    compatible[target_key] = value
+                    break
         if not compatible:
             parser.error(
                 "--backbone-init-checkpoint contained no compatible backbone weights"
             )
         target.load_state_dict(compatible, strict=False)
         print(
-            f"Initialized shared backbone from {args.backbone_init_checkpoint} "
+            f"Initialized backbone from {args.backbone_init_checkpoint} "
             f"({len(compatible)}/{len(target_state)} tensors)"
         )
         if hasattr(model, "load_baseline_classifier"):
@@ -736,8 +783,8 @@ def main():
         print(f"Training overrides active: {', '.join(active)} (label_smoothing={label_smoothing})")
 
     attn_suffix = f"_{args.attention}" if args.attention != "none" else ""
-    if args.model == "lesion_moe":
-        model_label = f"lesion_moe_{args.backbone1}_{args.routing_mode}"
+    if args.model in ("lesion_moe", "oracle_moe"):
+        model_label = f"{args.model}_{args.backbone1}_{args.routing_mode}"
     elif is_expert_fusion:
         if args.expert_mode == "multi_layer":
             parts = [args.model, "ml", args.backbone1]
@@ -788,6 +835,8 @@ def main():
         parser.error("--router-dropout must be in [0, 1)")
     if args.router_temperature <= 0:
         parser.error("--router-temperature must be positive")
+    if args.router_lr_scale <= 0:
+        parser.error("--router-lr-scale must be positive")
     if any(value < 0 for value in (
         args.load_balance_weight,
         args.diversity_weight,
@@ -803,6 +852,8 @@ def main():
         parser.error("MoE auxiliary and vote weights must be non-negative")
     if args.expert_warmup_epochs < 0:
         parser.error("--expert-warmup-epochs must be non-negative")
+    if args.expert_pretrain_epochs < 1:
+        parser.error("--expert-pretrain-epochs must be positive")
     if not 0.0 <= args.expert_dropout < 1.0:
         parser.error("--expert-dropout must be in [0, 1)")
     if args.router_gain_temperature <= 0:
@@ -811,6 +862,14 @@ def main():
         parser.error("--correction-max-scale must be non-negative")
     if args.correction_ramp_epochs < 0:
         parser.error("--correction-ramp-epochs must be non-negative")
+    if (
+        args.model == "oracle_moe"
+        and train_freeze_epochs != args.expert_pretrain_epochs
+    ):
+        parser.error(
+            "oracle_moe requires --freeze-epochs to equal "
+            "--expert-pretrain-epochs"
+        )
     ema_enabled = (
         args.ema if "--ema" in supplied_options or "--no-ema" in supplied_options
         else overrides.get("ema", False)
@@ -834,41 +893,84 @@ def main():
         f"monitor={monitor_metric}/{monitor_mode} | freeze_epochs={train_freeze_epochs}"
     )
 
-    final_metrics = train_model(
-        model=model,
-        head_name=head_name,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        criterion=criterion,
-        lr=train_lr,
-        device=device,
-        num_classes=num_classes,
-        num_epochs=args.epochs,
-        freeze_epochs=train_freeze_epochs,
-        model_name=model_label,
-        save_dir=model_save_dir,
-        skip_freeze=is_vit,
-        use_amp=args.amp,
-        weight_decay=train_weight_decay,
-        scheduler_type=train_scheduler,
-        monitor_metric=monitor_metric,
-        monitor_mode=monitor_mode,
-        scheduler_factor=scheduler_factor,
-        scheduler_patience=scheduler_patience,
-        early_stopping=overrides.get("early_stopping", False),
-        es_patience=overrides.get("es_patience", 15),
-        es_min_delta=overrides.get("es_min_delta", 0.0),
-        ema=ema_enabled,
-        ema_decay=ema_decay,
-        grad_clip=overrides.get("grad_clip", None),
-        mixup_alpha=mixup_alpha,
-        cutmix_alpha=cutmix_alpha,
-        mix_prob=mix_prob,
-        eval_tta=eval_tta,
-        train_scales=train_scales,
-    )
+    if args.evaluate_only:
+        best_model_path = os.path.join(
+            model_save_dir, f"{model_label}_best.pth",
+        )
+        if not os.path.isfile(best_model_path):
+            parser.error(
+                "--evaluate-only requires the existing minimum-validation-loss "
+                f"checkpoint: {best_model_path}"
+            )
+        print(
+            "\nEvaluation-only protocol active: training is skipped and the "
+            "locked minimum-validation-loss checkpoint will be evaluated."
+        )
+        final_metrics = None
+    else:
+        final_metrics = train_model(
+            model=model,
+            head_name=head_name,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            criterion=criterion,
+            lr=train_lr,
+            device=device,
+            num_classes=num_classes,
+            num_epochs=args.epochs,
+            freeze_epochs=train_freeze_epochs,
+            model_name=model_label,
+            save_dir=model_save_dir,
+            skip_freeze=is_vit,
+            use_amp=args.amp,
+            weight_decay=train_weight_decay,
+            scheduler_type=train_scheduler,
+            monitor_metric=monitor_metric,
+            monitor_mode=monitor_mode,
+            scheduler_factor=scheduler_factor,
+            scheduler_patience=scheduler_patience,
+            early_stopping=overrides.get("early_stopping", False),
+            es_patience=overrides.get("es_patience", 15),
+            es_min_delta=overrides.get("es_min_delta", 0.0),
+            ema=ema_enabled,
+            ema_decay=ema_decay,
+            grad_clip=overrides.get("grad_clip", None),
+            mixup_alpha=mixup_alpha,
+            cutmix_alpha=cutmix_alpha,
+            mix_prob=mix_prob,
+            eval_tta=eval_tta,
+            train_scales=train_scales,
+        )
 
-    plot_training_curves(final_metrics["history"], results_dir, model_label)
+        plot_training_curves(final_metrics["history"], results_dir, model_label)
+
+    evaluation_test_loader = None if args.validation_only else test_loader
+    if args.validation_only:
+        print(
+            "\nValidation-only protocol active: the official test split will "
+            "not be evaluated or used for diagnostics."
+        )
+
+    router_best_path = os.path.join(
+        model_save_dir, f"{model_label}_router_best.pth",
+    )
+    if (
+        bool(getattr(model, "oracle_protocol", False))
+        and os.path.exists(router_best_path)
+    ):
+        print(
+            f"\nLoading best trained-router candidate for oracle diagnostics "
+            f"from {router_best_path}"
+        )
+        model.load_state_dict(torch.load(
+            router_best_path, map_location=device, weights_only=True,
+        ))
+        run_oracle_diagnostics(
+            # The official test split is never used for oracle/expert
+            # diagnostics. It is reserved for the locked learned model below.
+            model, val_loader, None, criterion, device,
+            num_classes, results_dir, model_label, tta=eval_tta,
+        )
 
     best_model_path = os.path.join(model_save_dir, f"{model_label}_best.pth")
     if os.path.exists(best_model_path):
@@ -876,26 +978,27 @@ def main():
         model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
 
     final_results = evaluate_all_splits(
-        model, train_eval_loader, val_loader, test_loader,
+        model, train_eval_loader, val_loader, evaluation_test_loader,
         criterion, device, num_classes, tta=eval_tta,
     )
 
-    test_metrics = run_test_evaluation(
-        model, test_loader, class_names, num_classes,
-        device, results_dir, model_label, head_name,
-        model_name=args.model, is_expert_fusion=is_expert_fusion,
-        tta=eval_tta,
-        val_loader=val_loader,
-        calibrate_binary=calibrate_binary,
-    )
+    if not bool(getattr(model, "oracle_protocol", False)):
+        run_expert_diagnostics(
+            model, val_loader, evaluation_test_loader, device, num_classes,
+            class_names, results_dir, model_label, tta=eval_tta,
+        )
 
-    run_expert_diagnostics(
-        model, val_loader, test_loader, device, num_classes,
-        class_names, results_dir, model_label, tta=eval_tta,
-    )
-
-    if "test" in final_results:
-        final_results["test"].update(test_metrics)
+    if not args.validation_only:
+        test_metrics = run_test_evaluation(
+            model, test_loader, class_names, num_classes,
+            device, results_dir, model_label, head_name,
+            model_name=args.model, is_expert_fusion=is_expert_fusion,
+            tta=eval_tta,
+            val_loader=val_loader,
+            calibrate_binary=calibrate_binary,
+        )
+        if "test" in final_results:
+            final_results["test"].update(test_metrics)
 
     save_results_csv(
         final_results, results_csv,
@@ -904,11 +1007,12 @@ def main():
         args.batch_size, args.epochs, train_lr,
     )
 
-    history_path = os.path.join(
-        args.output_dir, "results", args.dataset,
-        f"{model_label}_bs{args.batch_size}_ep{args.epochs}_lr{train_lr}_history.json",
-    )
-    save_history_json(final_metrics["history"], history_path)
+    if final_metrics is not None:
+        history_path = os.path.join(
+            args.output_dir, "results", args.dataset,
+            f"{model_label}_bs{args.batch_size}_ep{args.epochs}_lr{train_lr}_history.json",
+        )
+        save_history_json(final_metrics["history"], history_path)
 
     print(f"\n{'='*60}")
     print("Training complete!")

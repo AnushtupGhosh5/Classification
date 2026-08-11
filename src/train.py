@@ -203,6 +203,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes
             if (
                 baseline_logits is None or expert_logits is None
                 or probabilities is None or weight <= 0
+                or result.get("router_gain_enabled") is False
             ):
                 return 0.0
 
@@ -226,7 +227,39 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, num_classes
                 + (1.0 - lam) * per_sample_ce(expert_logits[:, index], labels_b)
                 for index in range(expert_logits.size(1))
             ], dim=1)
-            gains = baseline_loss.unsqueeze(1) - expert_losses
+            if probabilities.size(1) == expert_losses.size(1) + 1:
+                # Explicit route 0 means keep the immutable baseline. Its
+                # gain is exactly zero; expert routes compete only when their
+                # corrected prediction reduces baseline loss.
+                candidate_losses = torch.cat(
+                    (baseline_loss.unsqueeze(1), expert_losses), dim=1,
+                )
+            else:
+                candidate_losses = expert_losses
+            gains = baseline_loss.unsqueeze(1) - candidate_losses
+            if result.get("hard_oracle_router") is True:
+                hard_targets = gains.detach().argmax(dim=1)
+                route_counts = torch.bincount(
+                    hard_targets, minlength=probabilities.size(1),
+                ).to(probabilities.dtype)
+                # Sqrt inverse-frequency balancing prevents the most common
+                # oracle route from becoming the same global shortcut seen in
+                # v1, without giving a one-sample route extreme influence.
+                route_weights = torch.zeros_like(route_counts)
+                present = route_counts > 0
+                route_weights[present] = torch.sqrt(
+                    hard_targets.numel()
+                    / (probabilities.size(1) * route_counts[present])
+                )
+                sample_weights = route_weights[hard_targets]
+                hard_loss = -probabilities.clamp_min(1e-8).log().gather(
+                    1, hard_targets.unsqueeze(1),
+                ).squeeze(1)
+                routing_loss = (
+                    (hard_loss * sample_weights).sum()
+                    / sample_weights.sum().clamp_min(1e-8)
+                )
+                return weight * routing_loss
             temperature = max(
                 float(getattr(model, "router_gain_temperature", 0.25)), 1e-4,
             )
@@ -444,6 +477,31 @@ def _run_epoch(epoch, num_epochs, stage_label, model, train_loader, val_loader,
                 ema.restore(model)
         print(f"  -> Best model saved ({monitor_metric}: {best_monitor_score:.4f})")
 
+    # Oracle-first diagnostics need the best trained-router candidate even
+    # when the immutable baseline remains the official minimum-loss model.
+    # This separate artifact never replaces the official *_best.pth file.
+    if (
+        bool(getattr(model, "oracle_protocol", False))
+        and epoch > int(getattr(model, "expert_pretrain_epochs", 0))
+    ):
+        router_best = float(getattr(model, "_router_best_val_loss", float("inf")))
+        if monitor_value < router_best:
+            if ema is not None:
+                ema.apply_shadow(model)
+            try:
+                router_path = os.path.join(
+                    save_dir, f"{model_name}_router_best.pth",
+                )
+                torch.save(model.state_dict(), router_path)
+            finally:
+                if ema is not None:
+                    ema.restore(model)
+            model._router_best_val_loss = float(monitor_value)
+            print(
+                f"  -> Router diagnostic checkpoint saved "
+                f"({monitor_metric}: {monitor_value:.4f})"
+            )
+
     should_stop = False
     if early_stopping is not None and early_stopping.step(monitor_value):
         should_stop = True
@@ -566,6 +624,8 @@ def train_model(
         if freeze_epochs > 0:
             print(f"\n--- Stage 1: Frozen backbone ({freeze_epochs} epochs) ---")
             freeze_backbone(model, head_name)
+            if hasattr(model, "configure_expert_pretraining"):
+                model.configure_expert_pretraining()
             # For expert fusion: backbone frozen but branches/fusion/head trainable
             # For regular models: only head is trainable
             trainable = [p for p in model.parameters() if p.requires_grad]
@@ -612,12 +672,16 @@ def train_model(
             unfreeze_all(model)
             if hasattr(model, "protect_loaded_baseline"):
                 model.protect_loaded_baseline()
+            if hasattr(model, "configure_router_training"):
+                model.configure_router_training()
 
             head = getattr(model, head_name)
             head_params_list = list(head.parameters())
             correction_gate = getattr(model, "correction_gate", None)
             if correction_gate is not None:
                 head_params_list.extend(correction_gate.parameters())
+            if bool(getattr(model, "router_full_lr", False)):
+                head_params_list.extend(model.router.parameters())
             head_param_ids = set(id(p) for p in head_params_list)
 
             backbone_name = getattr(model, "_backbone_module_name", None)
@@ -663,7 +727,8 @@ def train_model(
                 ]
                 if trainable_head_params:
                     parameter_groups.append({
-                        "params": trainable_head_params, "lr": lr,
+                        "params": trainable_head_params,
+                        "lr": lr * float(getattr(model, "router_lr_scale", 1.0)),
                         "weight_decay": weight_decay,
                     })
                 stage2_optimizer = torch.optim.AdamW(parameter_groups)

@@ -663,7 +663,8 @@ def create_lesion_moe(num_classes=2, pretrained=True, attention=None,
                       correction_ramp_epochs=0,
                       residual_distill_weight=0.0,
                       router_gain_weight=0.0,
-                      router_gain_temperature=0.25):
+                      router_gain_temperature=0.25,
+                      router_lr_scale=1.0):
     model = LesionExpertMoE(
         backbone_name=backbone1,
         pretrained=pretrained,
@@ -688,4 +689,5 @@ def create_lesion_moe(num_classes=2, pretrained=True, attention=None,
     )
     model.router_gain_loss_weight = router_gain_weight
     model.router_gain_temperature = router_gain_temperature
+    model.router_lr_scale = float(router_lr_scale)
     return model, "head"

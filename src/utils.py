@@ -323,6 +323,157 @@ def compute_expert_diagnostics(model, dataloader, device, num_classes,
 
 
 @torch.no_grad()
+def compute_oracle_diagnostics(model, dataloader, criterion, device,
+                               num_classes, tta=False):
+    """Compare baseline, uniform, learned, best-expert, and oracle routing.
+
+    The oracle chooses the lowest-loss candidate independently for each
+    validation sample. It is an upper-bound diagnostic, never a deployable
+    result and never used to update model parameters.
+    """
+    model.eval()
+    baseline_batches = []
+    uniform_batches = []
+    learned_batches = []
+    expert_batches = []
+    route_batches = []
+    label_batches = []
+
+    for images, labels in dataloader:
+        images = images.to(device)
+        learned, _, details = _forward_with_tta_details(
+            model, images, tta=tta,
+        )
+        if (
+            details.get("baseline_logits") is None
+            or details.get("expert_logits") is None
+            or details.get("router_probabilities") is None
+        ):
+            return None
+        baseline_batches.append(details["baseline_logits"].cpu())
+        uniform_batches.append(details["correction_logits"].cpu())
+        learned_batches.append(learned.cpu())
+        expert_batches.append(details["expert_logits"].cpu())
+        route_batches.append(details["router_probabilities"].cpu())
+        label_batches.append(labels.cpu())
+
+    if not label_batches:
+        return None
+
+    baseline = torch.cat(baseline_batches)
+    uniform = torch.cat(uniform_batches)
+    learned = torch.cat(learned_batches)
+    experts = torch.cat(expert_batches)
+    routes = torch.cat(route_batches)
+    labels = torch.cat(label_batches)
+    candidate_logits = torch.cat((baseline.unsqueeze(1), experts), dim=1)
+
+    def per_sample_loss(logits):
+        if isinstance(criterion, nn.CrossEntropyLoss):
+            weight = criterion.weight
+            if weight is not None:
+                weight = weight.detach().cpu()
+            return F.cross_entropy(
+                logits,
+                labels,
+                weight=weight,
+                reduction="none",
+                label_smoothing=criterion.label_smoothing,
+            )
+        return F.cross_entropy(logits, labels, reduction="none")
+
+    candidate_losses = torch.stack([
+        per_sample_loss(candidate_logits[:, index])
+        for index in range(candidate_logits.size(1))
+    ], dim=1)
+    oracle_indices = candidate_losses.argmin(dim=1)
+    row_indices = torch.arange(labels.numel())
+    oracle_logits = candidate_logits[row_indices, oracle_indices]
+
+    def metrics_and_loss(logits):
+        metrics = compute_metrics(
+            labels.numpy(), logits.argmax(dim=1).numpy(), num_classes,
+        )
+        losses = per_sample_loss(logits)
+        if isinstance(criterion, nn.CrossEntropyLoss) and criterion.weight is not None:
+            # Match CrossEntropyLoss(reduction="mean"): weighted CE divides
+            # by the sum of target-class weights, not by the sample count.
+            denominator = criterion.weight.detach().cpu()[labels].sum()
+            loss = losses.sum() / denominator.clamp_min(1e-8)
+        else:
+            loss = losses.mean()
+        metrics["loss"] = round(float(loss), 6)
+        return metrics
+
+    expert_names = list(getattr(model, "expert_names", ()))
+    route_names = list(getattr(model, "route_names", ()))
+    if len(expert_names) != experts.size(1):
+        expert_names = [f"expert{index}" for index in range(experts.size(1))]
+    if len(route_names) != routes.size(1):
+        route_names = ["no_correction", *expert_names]
+
+    expert_reports = {
+        name: metrics_and_loss(experts[:, index])
+        for index, name in enumerate(expert_names)
+    }
+    best_single_name = min(
+        expert_names, key=lambda name: expert_reports[name]["loss"],
+    )
+    learned_indices = routes.argmax(dim=1)
+    route_report = {
+        name: {
+            "mean_probability": round(float(routes[:, index].mean()), 6),
+            "argmax_frequency": round(
+                float((learned_indices == index).float().mean()), 6,
+            ),
+            "oracle_frequency": round(
+                float((oracle_indices == index).float().mean()), 6,
+            ),
+        }
+        for index, name in enumerate(route_names)
+    }
+
+    baseline_report = metrics_and_loss(baseline)
+    uniform_report = metrics_and_loss(uniform)
+    learned_report = metrics_and_loss(learned)
+    oracle_report = metrics_and_loss(oracle_logits)
+    accuracy_oracle_gap = (
+        oracle_report["accuracy"] - baseline_report["accuracy"]
+    )
+    accuracy_gap_recovery = (
+        (learned_report["accuracy"] - baseline_report["accuracy"])
+        / accuracy_oracle_gap
+        if abs(accuracy_oracle_gap) > 1e-8 else 0.0
+    )
+
+    return {
+        "num_samples": int(labels.numel()),
+        "baseline": baseline_report,
+        "uniform_correction": uniform_report,
+        "learned_router": learned_report,
+        "oracle_router": oracle_report,
+        "expert_candidates": expert_reports,
+        "best_single_expert": best_single_name,
+        "routing": route_report,
+        "learned_matches_oracle": round(
+            float((learned_indices == oracle_indices).float().mean()), 6,
+        ),
+        "oracle_majority_route_frequency": round(float(
+            torch.bincount(
+                oracle_indices, minlength=candidate_logits.size(1),
+            ).max() / labels.numel()
+        ), 6),
+        "accuracy_oracle_gap_recovery": round(
+            float(accuracy_gap_recovery), 6,
+        ),
+        "oracle_improves_loss_fraction": round(float(
+            (candidate_losses.min(dim=1).values < candidate_losses[:, 0])
+            .float().mean()
+        ), 6),
+    }
+
+
+@torch.no_grad()
 def extract_features(model, dataloader, device, head_name="classifier"):
     model.eval()
     all_features = []

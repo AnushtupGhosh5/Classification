@@ -7,6 +7,7 @@ import torch
 import json
 from src.utils import (
     compute_expert_diagnostics,
+    compute_oracle_diagnostics,
     evaluate_model,
     extract_features,
     forward_with_tta,
@@ -88,6 +89,56 @@ def run_expert_diagnostics(model, val_loader, test_loader, device, num_classes,
         with open(path, "w") as file:
             json.dump(reports, file, indent=2)
         print(f"Saved expert diagnostics: {path}")
+    return reports or None
+
+
+def run_oracle_diagnostics(model, val_loader, test_loader, criterion, device,
+                           num_classes, save_dir, model_label, tta=False):
+    """Persist the oracle-first ablation without using it for optimization."""
+    if not bool(getattr(model, "oracle_protocol", False)):
+        return None
+    reports = {}
+    for split_name, loader in (("validation", val_loader), ("test", test_loader)):
+        if loader is None or len(loader.dataset) == 0:
+            continue
+        report = compute_oracle_diagnostics(
+            model, loader, criterion, device, num_classes, tta=tta,
+        )
+        if report is None:
+            continue
+        reports[split_name] = report
+        print(f"\n{split_name.upper()} ORACLE-FIRST DIAGNOSTICS:")
+        for name in (
+            "baseline", "uniform_correction", "learned_router", "oracle_router",
+        ):
+            metrics = report[name]
+            print(
+                f"  {name:<20} loss={metrics['loss']:.4f} | "
+                f"Acc={metrics['accuracy']:.4f} | F1={metrics['f1']:.4f} | "
+                f"BAcc={metrics['balanced_accuracy']:.4f}"
+            )
+        print(
+            f"  Best single expert: {report['best_single_expert']} | "
+            f"oracle improves {report['oracle_improves_loss_fraction']:.1%} "
+            f"of samples | learned/oracle route agreement "
+            f"{report['learned_matches_oracle']:.1%} "
+            f"(majority shortcut={report['oracle_majority_route_frequency']:.1%}) | "
+            f"accuracy oracle-gap recovery="
+            f"{report['accuracy_oracle_gap_recovery']:.1%}"
+        )
+        for name, route in report["routing"].items():
+            print(
+                f"  Route {name:<13} p={route['mean_probability']:.3f} | "
+                f"argmax={route['argmax_frequency']:.3f} | "
+                f"oracle={route['oracle_frequency']:.3f}"
+            )
+
+    if reports:
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, f"{model_label}_oracle_diagnostics.json")
+        with open(path, "w") as file:
+            json.dump(reports, file, indent=2)
+        print(f"Saved oracle diagnostics: {path}")
     return reports or None
 
 
