@@ -1,47 +1,50 @@
 #!/bin/bash
 set -e
 
-# Research constraint: exactly one shared CNN backbone. The four lightweight
-# lesion specialists consume early/intermediate features and the input image;
-# they are not additional pretrained classifiers.
+# ISIC16 single-backbone, attention-equipped five-expert lesion MoE.
+#
+# One ConvNeXt-Tiny supplies hierarchical feature maps to the five routed
+# experts. Training matches the existing ISIC16 ConvNeXt-Tiny baseline recipe
+# (batch 16, 60 epochs, 1e-4 LR, sqrt sampling, skin transforms, and TTA).
+# The best checkpoint is selected strictly by minimum validation loss.
 python src/main.py \
     --output-dir outputs \
-    --run-name milk10k_single_backbone_experts_v4 \
-    --dataset milk10k \
-    --model lesion_moe \
+    --run-name isic16_convnext_five_expert_attention_v1 \
+    --dataset isic16 \
+    --model five_expert_moe \
     --backbone1 convnext_tiny \
-    --backbone-init-checkpoint outputs/models/milk10k/convnext_tiny_milk10k_b0_safe_recipe_v1/convnext_tiny_milk10k_b0_safe_recipe_v1_best.pth \
-    --protect-baseline \
-    --lesion-fusion-space features \
-    --epochs 50 \
-    --batch-size 16 \
-    --img-size 256 \
     --proj-dim 128 \
     --branch-depth 1 \
+    --expert-attention hybrid \
     --routing-mode soft \
-    --router-hidden 96 \
+    --router-hidden 128 \
     --router-dropout 0.10 \
-    --router-temperature 1.0 \
+    --router-temperature 0.70 \
+    --router-lr-scale 1.0 \
     --expert-aux-weight 0.15 \
     --expert-diversity-weight 0.001 \
-    --router-balance-weight 0.005 \
-    --expert-warmup-epochs 5 \
-    --correction-aux-weight 0.10 \
-    --correction-gate-init 0.0 \
-    --correction-max-scale 0.50 \
-    --correction-ramp-epochs 10 \
-    --lr 0.0002 \
+    --router-balance-weight 0.001 \
+    --router-gain-weight 0.20 \
+    --router-gain-temperature 0.15 \
+    --expert-dropout 0.05 \
+    --classifier-dropout 0.20 \
+    --epochs 60 \
+    --batch-size 16 \
+    --img-size 256 \
+    --augment-style skin \
+    --lr 0.0001 \
     --weight-decay 0.0001 \
-    --scheduler plateau \
+    --scheduler cosine \
     --loss ce \
     --label-smoothing 0.05 \
-    --freeze-epochs 5 \
+    --freeze-epochs 0 \
     --weighted-sampler \
     --sampler-mode sqrt \
-    --class-weight-power 0.25 \
+    --class-weight-power 0.0 \
+    --ema \
+    --ema-decay 0.995 \
     --early-stopping \
-    --es-patience 15 \
+    --es-patience 12 \
     --tta \
-    --validation-only \
-    --skip-train-evaluation \
+    --no-validation-only \
     --amp

@@ -14,7 +14,12 @@ import re
 from torch.utils.data import DataLoader
 
 from src.data.dataset_config import DATASET_REGISTRY, get_dataset_config
-from src.data.dataset import FolderDataset, create_splits
+from src.data.dataset import (
+    FolderDataset,
+    PairedLesionDataset,
+    create_milk10k_lesion_splits,
+    create_splits,
+)
 from src.data.preprocess import get_train_transforms, get_val_transforms
 from src.models.mobilenetv2 import create_mobilenetv2
 from src.models.mobilenetv3 import create_mobilenetv3_small, create_mobilenetv3_large
@@ -42,6 +47,9 @@ from src.models.mief import create_mief
 from src.models.moe_edf import create_moe_edf
 from src.models.lesion_moe import create_lesion_moe
 from src.models.oracle_moe import create_oracle_moe
+from src.models.paired_lesion_moe import create_paired_lesion_moe
+from src.models.paired_backbone import create_paired_convnext_tiny
+from src.models.five_expert_moe import create_five_expert_moe
 from src.losses import (
     FocalLoss,
     SEEFNetCEFocalLoss,
@@ -86,6 +94,9 @@ MODEL_REGISTRY = {
     "moe_edf": create_moe_edf,
     "lesion_moe": create_lesion_moe,
     "oracle_moe": create_oracle_moe,
+    "paired_lesion_moe": create_paired_lesion_moe,
+    "paired_convnext_tiny": create_paired_convnext_tiny,
+    "five_expert_moe": create_five_expert_moe,
 }
 
 ATTENTION_CHOICES = ["none", "se", "cbam", "eca"]
@@ -203,6 +214,81 @@ def get_data_loaders(
     return train_loader, train_eval_loader, val_loader, test_loader
 
 
+def get_milk10k_paired_loaders(
+    config,
+    class_names,
+    batch_size,
+    img_size,
+    num_workers,
+    seed,
+    use_weighted_sampler,
+    sampler_mode,
+    augment_style,
+    val_fraction,
+    test_fraction,
+):
+    """Load MILK10k as 5,240 lesion pairs with leakage-free splits."""
+    train_samples, val_samples, test_samples = create_milk10k_lesion_splits(
+        config["paired_images_dir"],
+        config["paired_ground_truth_csv"],
+        config["paired_metadata_csv"],
+        class_names,
+        seed=seed,
+        val_fraction=val_fraction,
+        test_fraction=test_fraction,
+    )
+    train_dataset = PairedLesionDataset(
+        train_samples,
+        transform=get_train_transforms(img_size, augment_style=augment_style),
+    )
+    evaluation_transform = get_val_transforms(
+        img_size, augment_style=augment_style,
+    )
+    train_eval_dataset = PairedLesionDataset(train_samples, evaluation_transform)
+    val_dataset = PairedLesionDataset(val_samples, evaluation_transform)
+    test_dataset = PairedLesionDataset(test_samples, evaluation_transform)
+
+    if use_weighted_sampler:
+        import math
+        from torch.utils.data import WeightedRandomSampler
+        counts = train_dataset.get_class_counts()
+        if sampler_mode == "sqrt":
+            class_weights = {
+                label: 1.0 / math.sqrt(count) for label, count in counts.items()
+            }
+            num_samples = len(train_samples)
+            mode_description = "sqrt-weighted"
+        else:
+            class_weights = {label: 1.0 / count for label, count in counts.items()}
+            num_samples = len(class_names) * max(counts.values())
+            mode_description = "equal"
+        sample_weights = [class_weights[sample[2]] for sample in train_samples]
+        sampler = WeightedRandomSampler(sample_weights, num_samples, replacement=True)
+        print(
+            f"  Paired WeightedRandomSampler ({mode_description}): "
+            f"{num_samples} lesions/epoch (original: {len(train_samples)})"
+        )
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, sampler=sampler,
+            num_workers=num_workers, pin_memory=True,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True,
+            num_workers=num_workers, pin_memory=True,
+        )
+    common = dict(
+        batch_size=batch_size, shuffle=False, num_workers=num_workers,
+        pin_memory=True,
+    )
+    return (
+        train_loader,
+        DataLoader(train_eval_dataset, **common),
+        DataLoader(val_dataset, **common),
+        DataLoader(test_dataset, **common),
+    )
+
+
 CSV_FIELDS = [
     "model", "dataset", "attention", "batch_size", "epochs", "lr", "split",
     "accuracy", "precision", "recall", "balanced_accuracy", "malignant_recall",
@@ -313,6 +399,40 @@ def main():
             "Fuse lesion specialists as class-logit corrections or as "
             "residuals before the one shared semantic classifier"
         ),
+    )
+    parser.add_argument(
+        "--expert-attention", type=str, default="none",
+        choices=["none", "hybrid", "se", "cbam", "eca"],
+        help=(
+            "Attention inside lesion experts; hybrid uses ECA texture, "
+            "CBAM morphology, SE color, and spatial boundary attention"
+        ),
+    )
+    parser.add_argument(
+        "--isolate-expert-backbone",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Stop specialist/auxiliary gradients at shared backbone taps; "
+            "the backbone remains trainable through the semantic final path"
+        ),
+    )
+    parser.add_argument(
+        "--paired-baseline-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "For paired_lesion_moe, train/evaluate only its paired semantic "
+            "expert as the matched single-backbone control"
+        ),
+    )
+    parser.add_argument(
+        "--milk-val-fraction", type=float, default=0.10,
+        help="Lesion-level MILK10k validation fraction",
+    )
+    parser.add_argument(
+        "--milk-local-test-fraction", type=float, default=0.20,
+        help="Lesion-level public-data holdout fraction (not hidden benchmark)",
     )
     parser.add_argument("--expert-aux-weight", type=float, default=0.15,
                         help="Mean auxiliary expert-classifier loss weight")
@@ -426,7 +546,7 @@ def main():
     parser.add_argument("--evaluate-only", action="store_true",
                         help="Load this run's existing minimum-validation-loss checkpoint and evaluate without retraining")
     parser.add_argument("--augment-style", type=str, default=None,
-                        choices=["balanced", "seefnet", "skin", "skin_focus"],
+                        choices=["balanced", "seefnet", "skin", "skin_focus", "milk_pair"],
                         help="Override the dataset's image augmentation policy")
     parser.add_argument("--weighted-sampler", action=argparse.BooleanOptionalAction,
                         default=None,
@@ -527,23 +647,49 @@ def main():
     img_size = override_default("img_size")
     if img_size != args.img_size:
         print(f"Dataset input size override: {img_size}")
-    train_loader, train_eval_loader, val_loader, test_loader = get_data_loaders(
-        data_dir, num_classes, class_names, has_predefined_splits,
-        args.batch_size, img_size, args.num_workers, args.seed,
-        split_dirs=split_dirs,
-        train_sample_limit=train_sample_limit,
-        train_sampling_strategy=train_sampling_strategy,
-        validate_images=validate_images,
-        fallback_val_from_train=fallback_val_from_train,
-        use_weighted_sampler=use_weighted_sampler,
-        sampler_mode=sampler_mode,
-        augment_style=augment_style,
+    paired_milk_protocol = args.model in (
+        "paired_lesion_moe", "paired_convnext_tiny",
     )
+    if paired_milk_protocol:
+        if args.dataset != "milk10k":
+            parser.error("paired MILK10k models are currently defined only for MILK10k")
+        if augment_style != "milk_pair":
+            print(
+                "Paired MILK10k protocol requires one view per modality; "
+                f"using milk_pair transforms instead of {augment_style}."
+            )
+            augment_style = "milk_pair"
+        train_loader, train_eval_loader, val_loader, test_loader = (
+            get_milk10k_paired_loaders(
+                config, class_names, args.batch_size, img_size,
+                args.num_workers, args.seed, use_weighted_sampler,
+                sampler_mode, augment_style, args.milk_val_fraction,
+                args.milk_local_test_fraction,
+            )
+        )
+        print(
+            "MILK10k protocol: paired clinical+dermoscopic lesions; "
+            "local test is a grouped public-training holdout, not the hidden benchmark."
+        )
+    else:
+        train_loader, train_eval_loader, val_loader, test_loader = get_data_loaders(
+            data_dir, num_classes, class_names, has_predefined_splits,
+            args.batch_size, img_size, args.num_workers, args.seed,
+            split_dirs=split_dirs,
+            train_sample_limit=train_sample_limit,
+            train_sampling_strategy=train_sampling_strategy,
+            validate_images=validate_images,
+            fallback_val_from_train=fallback_val_from_train,
+            use_weighted_sampler=use_weighted_sampler,
+            sampler_mode=sampler_mode,
+            augment_style=augment_style,
+        )
 
     is_vit = args.model in VIT_MODELS
     is_dual_fusion = args.model == "dual_fusion"
     is_expert_fusion = args.model in (
         "cef", "edf", "caef", "mief", "moe_edf", "lesion_moe", "oracle_moe",
+        "paired_lesion_moe", "five_expert_moe",
     )
     print(
         f"\nModel: {args.model} | Attention: {args.attention} | "
@@ -551,11 +697,21 @@ def main():
         f"Image size: {img_size}"
     )
     if is_expert_fusion:
-        if args.model in ("lesion_moe", "oracle_moe"):
+        if args.model == "five_expert_moe":
+            print(
+                f"Backbone: {args.backbone1} | Routed complete experts: "
+                f"texture/morphology/semantic/color/boundary | "
+                f"Routing: {args.routing_mode} | "
+                f"Expert attention: {args.expert_attention}"
+            )
+        elif args.model in (
+            "lesion_moe", "oracle_moe", "paired_lesion_moe",
+        ):
             print(
                 f"Semantic baseline: {args.backbone1} | Complementary experts: "
                 f"texture/morphology/color/boundary | Routing: {args.routing_mode} | "
-                f"Fusion space: {args.lesion_fusion_space}"
+                f"Fusion space: {args.lesion_fusion_space} | "
+                f"Expert attention: {args.expert_attention}"
             )
         elif args.expert_mode == "multi_layer":
             print(f"Expert mode: multi_layer | Backbone: {args.backbone1}")
@@ -574,7 +730,15 @@ def main():
                 f"dropout={args.router_dropout}, "
                 f"temperature={args.router_temperature}"
             )
-        elif args.model in ("lesion_moe", "oracle_moe"):
+        elif args.model == "five_expert_moe":
+            print(
+                f"Five-expert routing: expert_dropout={args.expert_dropout} | "
+                f"router_gain={args.router_gain_weight}@"
+                f"{args.router_gain_temperature}"
+            )
+        elif args.model in (
+            "lesion_moe", "oracle_moe", "paired_lesion_moe",
+        ):
             print(
                 f"Router: hidden={args.router_hidden}, "
                 f"dropout={args.router_dropout}, "
@@ -611,9 +775,14 @@ def main():
     use_imagenet_pretrained = not bool(
         args.init_checkpoint or args.backbone_init_checkpoint
     )
-    if args.model in ("lesion_moe", "oracle_moe"):
+    if args.model in (
+        "lesion_moe", "oracle_moe", "paired_lesion_moe",
+        "five_expert_moe",
+    ):
         residual_factory = (
             create_oracle_moe if args.model == "oracle_moe"
+            else create_paired_lesion_moe if args.model == "paired_lesion_moe"
+            else create_five_expert_moe if args.model == "five_expert_moe"
             else create_lesion_moe
         )
         residual_kwargs = dict(
@@ -645,8 +814,17 @@ def main():
         if args.model == "oracle_moe":
             residual_kwargs["expert_pretrain_epochs"] = args.expert_pretrain_epochs
             residual_kwargs["oracle_router_version"] = args.oracle_router_version
-        else:
+        elif args.model == "lesion_moe":
             residual_kwargs["fusion_space"] = args.lesion_fusion_space
+            residual_kwargs["expert_attention"] = args.expert_attention
+            residual_kwargs["isolate_expert_backbone"] = (
+                args.isolate_expert_backbone
+            )
+        else:
+            residual_kwargs["expert_attention"] = args.expert_attention
+            residual_kwargs["classifier_dropout"] = args.classifier_dropout
+            if args.model == "paired_lesion_moe":
+                residual_kwargs["paired_baseline_only"] = args.paired_baseline_only
         model, head_name = residual_factory(**residual_kwargs)
     elif is_expert_fusion:
         expert_kwargs = dict(
@@ -852,7 +1030,10 @@ def main():
         print(f"Training overrides active: {', '.join(active)} (label_smoothing={label_smoothing})")
 
     attn_suffix = f"_{args.attention}" if args.attention != "none" else ""
-    if args.model in ("lesion_moe", "oracle_moe"):
+    if args.model in (
+        "lesion_moe", "oracle_moe", "paired_lesion_moe",
+        "five_expert_moe",
+    ):
         model_label = f"{args.model}_{args.backbone1}_{args.routing_mode}"
     elif is_expert_fusion:
         if args.expert_mode == "multi_layer":
@@ -901,6 +1082,17 @@ def main():
     train_scales = args.train_scales
     if train_scales is not None and any(scale <= 0 for scale in train_scales):
         parser.error("--train-scales values must be positive")
+    if paired_milk_protocol and (mix_prob > 0 or train_scales):
+        parser.error(
+            "paired MILK10k models currently require --mix-prob 0 and no "
+            "--train-scales so both modalities remain paired"
+        )
+    if not 0 < args.milk_val_fraction < 1:
+        parser.error("--milk-val-fraction must be between 0 and 1")
+    if not 0 < args.milk_local_test_fraction < 1:
+        parser.error("--milk-local-test-fraction must be between 0 and 1")
+    if args.milk_val_fraction + args.milk_local_test_fraction >= 1:
+        parser.error("MILK10k validation + local-test fractions must be below 1")
     if args.router_hidden <= 0:
         parser.error("--router-hidden must be positive")
     if not 0.0 <= args.router_dropout < 1.0:

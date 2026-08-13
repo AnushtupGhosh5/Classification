@@ -78,14 +78,18 @@ def compute_per_class_metrics(y_true, y_pred, num_classes, class_names=None):
 def _forward_with_tta_details(model, images, tta=False):
     """Average logits and compact expert diagnostics over evaluation views."""
     batch_size = images.size(0)
-    crop_views = images.size(1) if images.dim() == 5 else 1
-    base_images = images.flatten(0, 1) if images.dim() == 5 else images
+    paired_input = bool(getattr(model, "paired_input", False))
+    crop_views = images.size(1) if images.dim() == 5 and not paired_input else 1
+    base_images = (
+        images.flatten(0, 1)
+        if images.dim() == 5 and not paired_input else images
+    )
     views = [base_images]
     if tta:
         views.extend([
-            torch.flip(base_images, dims=[3]),
-            torch.flip(base_images, dims=[2]),
-            torch.flip(base_images, dims=[2, 3]),
+            torch.flip(base_images, dims=[-1]),
+            torch.flip(base_images, dims=[-2]),
+            torch.flip(base_images, dims=[-2, -1]),
         ])
 
     logits = []
@@ -675,8 +679,12 @@ def extract_features(model, dataloader, device, head_name="classifier"):
     for images, labels in dataloader:
         images = images.to(device)
         batch_size = images.size(0)
-        crop_views = images.size(1) if images.dim() == 5 else 1
-        model_input = images.flatten(0, 1) if images.dim() == 5 else images
+        paired_input = bool(getattr(model, "paired_input", False))
+        crop_views = images.size(1) if images.dim() == 5 and not paired_input else 1
+        model_input = (
+            images.flatten(0, 1)
+            if images.dim() == 5 and not paired_input else images
+        )
         model(model_input)
 
         if "feat" in features_capture:

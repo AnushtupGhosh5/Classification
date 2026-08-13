@@ -62,6 +62,16 @@ DATASET_REGISTRY = {
         ],
         "num_classes": 11,
         "has_predefined_splits": True,
+        "paired_images_dir": os.path.join(
+            _DATA_ROOT, "MILK10k", "MILK10k_Training_Input",
+            "MILK10k_Training_Input",
+        ),
+        "paired_ground_truth_csv": os.path.join(
+            _DATA_ROOT, "MILK10k", "MILK10k_Training_GroundTruth.csv",
+        ),
+        "paired_metadata_csv": os.path.join(
+            _DATA_ROOT, "MILK10k", "MILK10k_Training_Metadata.csv",
+        ),
         "training_overrides": {
             # MILK10K mixes clinical and dermoscopic images.  The old SEEFNet
             # affine recipe can translate a small lesion out of view and adds

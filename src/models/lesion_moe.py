@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.backbone_extractor import create_backbone
+from src.models.attention import CBAM, ECA, SEBlock
 
 
 EXPERT_NAMES = ("texture", "morphology", "color", "boundary")
@@ -135,6 +136,44 @@ def _residual_stack(channels, depth):
     return nn.Sequential(*[LightweightResidual(channels) for _ in range(max(depth, 0))])
 
 
+class SpatialAttention(nn.Module):
+    """CBAM-style spatial attention without redundant channel gating."""
+
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        self.conv = nn.Conv2d(
+            2, 1, kernel_size, padding=kernel_size // 2, bias=False,
+        )
+
+    def forward(self, feature):
+        average = feature.mean(dim=1, keepdim=True)
+        maximum = feature.amax(dim=1, keepdim=True)
+        mask = torch.sigmoid(self.conv(torch.cat((average, maximum), dim=1)))
+        return feature * mask
+
+
+def _make_expert_attention(profile, expert_name, channels):
+    """Create either uniform or lesion-specialized expert attention."""
+    if profile == "none":
+        return nn.Identity()
+    if profile == "se":
+        return SEBlock(channels)
+    if profile == "eca":
+        return ECA(channels)
+    if profile == "cbam":
+        return CBAM(channels)
+    if profile == "hybrid":
+        # Texture/color primarily need channel selection; shape-oriented
+        # experts need spatial selection before global pooling.
+        return {
+            "texture": ECA(channels),
+            "morphology": CBAM(channels),
+            "color": SEBlock(channels),
+            "boundary": SpatialAttention(),
+        }[expert_name]
+    raise ValueError(f"Unknown expert attention profile: {profile}")
+
+
 def _resize(feature, size):
     if feature.shape[-2:] == size:
         return feature
@@ -155,7 +194,7 @@ def _gradient_magnitude(feature):
 
 
 class TextureExpert(nn.Module):
-    def __init__(self, in_channels, proj_dim, depth):
+    def __init__(self, in_channels, proj_dim, depth, attention="none"):
         super().__init__()
         self.project = ConvNormAct(in_channels, proj_dim, kernel_size=1)
         self.local = ConvNormAct(proj_dim, proj_dim, groups=proj_dim)
@@ -164,24 +203,31 @@ class TextureExpert(nn.Module):
         )
         self.mix = ConvNormAct(proj_dim * 2, proj_dim, kernel_size=1)
         self.blocks = _residual_stack(proj_dim, depth)
+        self.attention = _make_expert_attention(
+            attention, "texture", proj_dim,
+        )
 
     def forward(self, early, common_size):
         feature = self.project(early)
         feature = self.mix(torch.cat([self.local(feature), self.dilated(feature)], dim=1))
-        return _resize(self.blocks(feature), common_size)
+        return _resize(self.attention(self.blocks(feature)), common_size)
 
 
 class MorphologyExpert(nn.Module):
-    def __init__(self, in_channels, proj_dim, depth):
+    def __init__(self, in_channels, proj_dim, depth, attention="none"):
         super().__init__()
         self.project = ConvNormAct(in_channels, proj_dim, kernel_size=1)
         self.mix = ConvNormAct(proj_dim * 2, proj_dim, kernel_size=1)
         self.blocks = _residual_stack(proj_dim, depth)
+        self.attention = _make_expert_attention(
+            attention, "morphology", proj_dim,
+        )
 
     def forward(self, intermediate, common_size):
         learned = _resize(self.project(intermediate), common_size)
         geometry = _gradient_magnitude(learned)
-        return self.blocks(self.mix(torch.cat([learned, geometry], dim=1)))
+        feature = self.blocks(self.mix(torch.cat([learned, geometry], dim=1)))
+        return self.attention(feature)
 
 
 class SemanticExpert(nn.Module):
@@ -207,7 +253,7 @@ class SemanticExpert(nn.Module):
 class ColorExpert(nn.Module):
     """Lightweight chromatic CNN operating on recovered [0, 1] RGB."""
 
-    def __init__(self, proj_dim, depth):
+    def __init__(self, proj_dim, depth, attention="none"):
         super().__init__()
         widths = (24, 32, 48, 64)
         self.stem = ConvNormAct(6, widths[0], stride=2)
@@ -222,6 +268,7 @@ class ColorExpert(nn.Module):
         self.stages = nn.Sequential(*stages)
         self.project = ConvNormAct(widths[-1], proj_dim, kernel_size=1)
         self.blocks = _residual_stack(proj_dim, depth)
+        self.attention = _make_expert_attention(attention, "color", proj_dim)
 
     @staticmethod
     def chromatic_channels(rgb):
@@ -236,15 +283,19 @@ class ColorExpert(nn.Module):
 
     def forward(self, rgb, common_size):
         feature = self.stages(self.stem(self.chromatic_channels(rgb)))
-        return _resize(self.blocks(self.project(feature)), common_size)
+        feature = self.attention(self.blocks(self.project(feature)))
+        return _resize(feature, common_size)
 
 
 class BoundaryExpert(nn.Module):
-    def __init__(self, in_channels, proj_dim, depth):
+    def __init__(self, in_channels, proj_dim, depth, attention="none"):
         super().__init__()
         self.project = ConvNormAct(in_channels, proj_dim, kernel_size=1)
         self.mix = ConvNormAct(proj_dim * 4, proj_dim, kernel_size=1)
         self.blocks = _residual_stack(proj_dim, depth)
+        self.attention = _make_expert_attention(
+            attention, "boundary", proj_dim,
+        )
 
     def forward(self, early, common_size):
         learned = _resize(self.project(early), common_size)
@@ -252,7 +303,7 @@ class BoundaryExpert(nn.Module):
         horizontal = torch.abs(learned - torch.flip(learned, dims=(3,)))
         vertical = torch.abs(learned - torch.flip(learned, dims=(2,)))
         cues = torch.cat([learned, gradients, horizontal, vertical], dim=1)
-        return self.blocks(self.mix(cues))
+        return self.attention(self.blocks(self.mix(cues)))
 
 
 class DisagreementAwareRouter(nn.Module):
@@ -432,6 +483,8 @@ class LesionExpertMoE(nn.Module):
     def __init__(self, backbone_name="efficientnet_b0", pretrained=True,
                  proj_dim=128, num_classes=7, branch_depth=1,
                  fusion_space="logits",
+                 expert_attention="none",
+                 isolate_expert_backbone=False,
                  routing_mode="soft", router_hidden=128,
                  router_dropout=0.1, router_temperature=1.0,
                  expert_aux_weight=0.15, expert_diversity_weight=0.01,
@@ -456,10 +509,15 @@ class LesionExpertMoE(nn.Module):
         self.residual_distill_weight = float(residual_distill_weight)
         self.router_gain_loss_weight = 0.0
         self.router_gain_temperature = 0.25
+        # The router is a small decision module and should retain the configured
+        # head learning rate during staged fine-tuning.
+        self.router_full_lr = True
         self.backbone_name = backbone_name
         if fusion_space not in ("logits", "features"):
             raise ValueError(f"Unknown lesion-MoE fusion space: {fusion_space}")
         self.fusion_space = fusion_space
+        self.expert_attention = expert_attention
+        self.isolate_expert_backbone = bool(isolate_expert_backbone)
         # Persistent because the correction ramp is part of the model selected
         # by validation loss. Reloading a checkpoint must reproduce the exact
         # correction strength used in that validation epoch.
@@ -478,12 +536,17 @@ class LesionExpertMoE(nn.Module):
         )
         self.baseline_classifier = nn.Linear(deep_channels, num_classes)
         self.expert_modules = nn.ModuleDict({
-            "texture": TextureExpert(early_channels, proj_dim, branch_depth),
+            "texture": TextureExpert(
+                early_channels, proj_dim, branch_depth, expert_attention,
+            ),
             "morphology": MorphologyExpert(
                 intermediate_channels, proj_dim, branch_depth,
+                expert_attention,
             ),
-            "color": ColorExpert(proj_dim, branch_depth),
-            "boundary": BoundaryExpert(early_channels, proj_dim, branch_depth),
+            "color": ColorExpert(proj_dim, branch_depth, expert_attention),
+            "boundary": BoundaryExpert(
+                early_channels, proj_dim, branch_depth, expert_attention,
+            ),
         })
         self.router = DisagreementAwareRouter(
             proj_dim=proj_dim,
@@ -610,11 +673,18 @@ class LesionExpertMoE(nn.Module):
         semantic_feature = self.baseline_norm(baseline_pooled)
         baseline_logits = self.baseline_classifier(semantic_feature)
 
+        expert_early = early.detach() if self.isolate_expert_backbone else early
+        expert_intermediate = (
+            intermediate.detach()
+            if self.isolate_expert_backbone else intermediate
+        )
         features = [
-            self.expert_modules["texture"](early, common_size),
-            self.expert_modules["morphology"](intermediate, common_size),
+            self.expert_modules["texture"](expert_early, common_size),
+            self.expert_modules["morphology"](
+                expert_intermediate, common_size,
+            ),
             self.expert_modules["color"](rgb, common_size),
-            self.expert_modules["boundary"](early, common_size),
+            self.expert_modules["boundary"](expert_early, common_size),
         ]
         pooled = torch.stack([
             F.adaptive_avg_pool2d(feature, 1).flatten(1)
@@ -668,16 +738,35 @@ class LesionExpertMoE(nn.Module):
                 + correction_scale.unsqueeze(1) * routed_residual
             )
             logits = self.baseline_classifier(fused_feature)
+            # Auxiliary expert/router supervision must not pull the shared
+            # semantic representation or its one classifier in four competing
+            # directions. Use their current class geometry as a fixed teacher
+            # for these auxiliary candidates. The official routed CE above
+            # remains fully end-to-end and can still adapt every component.
+            auxiliary_semantic = semantic_feature.detach()
+            classifier_weight = self.baseline_classifier.weight.detach()
+            classifier_bias = (
+                self.baseline_classifier.bias.detach()
+                if self.baseline_classifier.bias is not None else None
+            )
             expert_logits = torch.stack([
-                self.baseline_classifier(
-                    semantic_feature + expert_residuals[:, index]
+                F.linear(
+                    auxiliary_semantic + expert_residuals[:, index],
+                    classifier_weight, classifier_bias,
                 )
                 for index in range(expert_residuals.size(1))
             ], dim=1)
-            uniform_residual = expert_residuals.mean(dim=1)
-            correction_logits = self.baseline_classifier(
-                semantic_feature + correction_scale.unsqueeze(1)
-                * uniform_residual
+            # Supervise the actual soft router without the final correction
+            # gate. During warm-up ``weights`` is intentionally uniform and
+            # the final prediction stays on the semantic path, but this
+            # separate candidate remains connected to ``probabilities`` so
+            # the router learns which expert helps each sample.
+            auxiliary_routed_residual = (
+                probabilities.unsqueeze(-1) * expert_residuals
+            ).sum(dim=1)
+            correction_logits = F.linear(
+                auxiliary_semantic + auxiliary_routed_residual,
+                classifier_weight, classifier_bias,
             )
             expert_delta_logits = expert_logits - baseline_logits.unsqueeze(1)
         else:
@@ -720,6 +809,8 @@ def create_lesion_moe(num_classes=2, pretrained=True, attention=None,
                       backbone1="efficientnet_b0", backbone2=None,
                       backbone3=None, proj_dim=128, branch_depth=1,
                       fusion_space="logits",
+                      expert_attention="none",
+                      isolate_expert_backbone=False,
                       routing_mode="soft", router_hidden=128,
                       router_dropout=0.1, router_temperature=1.0,
                       expert_aux_weight=0.15,
@@ -742,6 +833,8 @@ def create_lesion_moe(num_classes=2, pretrained=True, attention=None,
         num_classes=num_classes,
         branch_depth=branch_depth,
         fusion_space=fusion_space,
+        expert_attention=expert_attention,
+        isolate_expert_backbone=isolate_expert_backbone,
         routing_mode=routing_mode,
         router_hidden=router_hidden,
         router_dropout=router_dropout,

@@ -1,5 +1,6 @@
 import os
 import random
+import csv
 from collections import defaultdict
 from PIL import Image, UnidentifiedImageError
 from torch.utils.data import Dataset
@@ -330,5 +331,135 @@ class FolderDataset(Dataset):
     def get_class_counts(self):
         counts = {}
         for _, label in self.samples:
+            counts[label] = counts.get(label, 0) + 1
+        return counts
+
+
+def create_milk10k_lesion_splits(
+    images_dir,
+    ground_truth_csv,
+    metadata_csv,
+    class_names,
+    seed=42,
+    val_fraction=0.10,
+    test_fraction=0.20,
+):
+    """Create deterministic, stratified MILK10k splits at lesion level.
+
+    Each returned sample contains the clinical and dermoscopic image belonging
+    to the same lesion.  Splitting *before* expanding image pairs prevents the
+    cross-split lesion leakage present in the old third-party folder split.
+    The returned test partition is a local development holdout from the public
+    training set; it is not the hidden MILK10k Benchmark test set.
+    """
+    if val_fraction <= 0 or test_fraction <= 0:
+        raise ValueError("MILK10k validation and local-test fractions must be positive")
+    if val_fraction + test_fraction >= 1:
+        raise ValueError("MILK10k validation + local-test fractions must be below 1")
+
+    class_to_idx = {name: index for index, name in enumerate(class_names)}
+    with open(ground_truth_csv, newline="") as file:
+        truth_rows = list(csv.DictReader(file))
+    with open(metadata_csv, newline="") as file:
+        metadata_rows = list(csv.DictReader(file))
+
+    labels_by_lesion = {}
+    for row in truth_rows:
+        positive = [name for name in class_names if float(row.get(name, 0.0)) >= 0.5]
+        if len(positive) != 1:
+            raise ValueError(
+                f"Expected one diagnosis for {row.get('lesion_id')}, got {positive}"
+            )
+        labels_by_lesion[row["lesion_id"]] = class_to_idx[positive[0]]
+
+    images_by_lesion = defaultdict(dict)
+    for row in metadata_rows:
+        lesion_id = row["lesion_id"]
+        image_type = row["image_type"].strip().lower()
+        if image_type == "clinical: close-up":
+            modality = "clinical"
+        elif image_type == "dermoscopic":
+            modality = "dermoscopic"
+        else:
+            continue
+        images_by_lesion[lesion_id][modality] = os.path.join(
+            images_dir, lesion_id, f"{row['isic_id']}.jpg",
+        )
+
+    samples = []
+    missing = []
+    for lesion_id, label in sorted(labels_by_lesion.items()):
+        pair = images_by_lesion.get(lesion_id, {})
+        clinical = pair.get("clinical")
+        dermoscopic = pair.get("dermoscopic")
+        if not clinical or not dermoscopic or not os.path.isfile(clinical) or not os.path.isfile(dermoscopic):
+            missing.append(lesion_id)
+            continue
+        samples.append((clinical, dermoscopic, label, lesion_id))
+    if missing:
+        preview = ", ".join(missing[:5])
+        raise FileNotFoundError(
+            f"MILK10k has {len(missing)} incomplete lesion pairs; examples: {preview}"
+        )
+
+    labels = [sample[2] for sample in samples]
+    train_val, test_samples = train_test_split(
+        samples,
+        test_size=test_fraction,
+        random_state=seed,
+        stratify=labels,
+    )
+    relative_val_fraction = val_fraction / (1.0 - test_fraction)
+    train_val_labels = [sample[2] for sample in train_val]
+    train_samples, val_samples = train_test_split(
+        train_val,
+        test_size=relative_val_fraction,
+        random_state=seed,
+        stratify=train_val_labels,
+    )
+
+    _print_paired_split_counts("Train lesions", train_samples, len(class_names))
+    _print_paired_split_counts("Val lesions", val_samples, len(class_names))
+    _print_paired_split_counts("Local test lesions", test_samples, len(class_names))
+    train_ids = {sample[3] for sample in train_samples}
+    val_ids = {sample[3] for sample in val_samples}
+    test_ids = {sample[3] for sample in test_samples}
+    if train_ids & val_ids or train_ids & test_ids or val_ids & test_ids:
+        raise RuntimeError("MILK10k lesion-grouped split unexpectedly overlaps")
+    print("  MILK10k grouping audit: 0 lesion IDs cross splits")
+    return train_samples, val_samples, test_samples
+
+
+def _print_paired_split_counts(split_name, samples, num_classes):
+    counts = {index: 0 for index in range(num_classes)}
+    for _, _, label, _ in samples:
+        counts[label] += 1
+    parts = [f"class{index}: {counts[index]}" for index in range(num_classes)]
+    print(f"  {split_name}: {len(samples)} paired lesions | {', '.join(parts)}")
+
+
+class PairedLesionDataset(Dataset):
+    """Return a clinical/dermoscopic pair as ``[2, C, H, W]``."""
+
+    def __init__(self, samples, transform=None):
+        self.samples = samples
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        clinical_path, dermoscopic_path, label, _lesion_id = self.samples[index]
+        clinical = Image.open(clinical_path).convert("RGB")
+        dermoscopic = Image.open(dermoscopic_path).convert("RGB")
+        if self.transform:
+            clinical = self.transform(clinical)
+            dermoscopic = self.transform(dermoscopic)
+        import torch
+        return torch.stack((clinical, dermoscopic), dim=0), label
+
+    def get_class_counts(self):
+        counts = {}
+        for _, _, label, _ in self.samples:
             counts[label] = counts.get(label, 0) + 1
         return counts

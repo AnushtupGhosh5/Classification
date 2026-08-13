@@ -1,117 +1,141 @@
-# Class-Aware Lesion Correction MoE (Router v3)
+# Attention-Guided Five-Expert Lesion MoE
 
 ## Inference architecture
 
 ```mermaid
 flowchart LR
-    I["Lesion image<br/>256 x 256"] --> CNN["Frozen shared<br/>ConvNeXt-Tiny"]
+    I["Input lesion image<br/>256 x 256"]
+    B["One shared CNN backbone<br/>ConvNeXt-Tiny"]
+    E["Early feature map"]
+    M["Intermediate feature map"]
+    D["Deep feature map"]
+    RGB["Recovered RGB image<br/>range 0 to 1"]
 
-    CNN --> FE["Early<br/>features"]
-    CNN --> FM["Intermediate<br/>features"]
-    CNN --> FD["Deep<br/>features"]
+    I --> B
+    I --> RGB
+    B --> E
+    B --> M
+    B --> D
 
-    FD --> BASE["GAP + LayerNorm<br/>baseline classifier"]
-    BASE --> Z0["Semantic baseline<br/>logits z0"]
+    E --> T["Texture expert<br/>local + dilated filters<br/>ECA attention"]
+    M --> S["Morphology expert<br/>learned + Sobel cues<br/>CBAM attention"]
+    D --> SEM["Semantic expert<br/>deep features<br/>channel gate"]
+    RGB --> C["Color expert<br/>chromatic channels<br/>SE attention"]
+    E --> BD["Boundary expert<br/>gradient + symmetry cues<br/>spatial attention"]
 
-    FE --> TEX["Texture"]
-    FM --> MOR["Morphology"]
-    I --> COL["Color"]
-    FE --> BND["Boundary"]
+    T --> A["Align feature maps<br/>to intermediate resolution"]
+    S --> A
+    SEM --> A
+    C --> A
+    BD --> A
 
-    TEX --> SET["Aligned expert maps<br/>{FT, FM, FC, FB}<br/>128 channels"]
-    MOR --> SET
-    COL --> SET
-    BND --> SET
+    A --> P["Global average pooling<br/>five 128-D descriptors"]
+    P --> H["Five independent heads<br/>LayerNorm + Dropout + Linear"]
+    H --> Z["Complete expert logits<br/>zT, zM, zS, zC, zB"]
 
-    SET --> POOL["Per-expert GAP<br/>{pT, pM, pC, pB}"]
-    POOL --> HEAD["Four delta heads"]
-    HEAD --> DELTA["Logit corrections<br/>{delta zi}"]
+    P --> R["Disagreement-aware router<br/>descriptor + global context<br/>cosine/absolute disagreement<br/>expert identity"]
+    R --> W["Soft sample-wise weights<br/>wT, wM, wS, wC, wB"]
 
-    Z0 --> CAND["Candidate predictions<br/>zi = z0 + delta zi"]
-    DELTA --> CAND
-    POOL --> ROUTER["Class-aware evidence router<br/>context + disagreement<br/>uncertainty + class probabilities"]
-    CAND --> ROUTER
-    Z0 --> ROUTER
-
-    ROUTER --> W["Soft routing weights<br/>{w0, wT, wM, wC, wB}"]
-    Z0 --> FUSE["Residual fusion<br/>z = z0 + sum wi delta zi"]
-    DELTA --> FUSE
-    W --> FUSE
-    FUSE --> OUT["Final class<br/>probabilities"]
+    Z --> F["Weighted logit fusion<br/>z = sum wi zi"]
+    W --> F
+    F --> O["Softmax<br/>final class probabilities"]
 
     classDef input fill:#EAF2FF,stroke:#3973B7,color:#111;
-    classDef base fill:#EAF7ED,stroke:#3A7D44,color:#111;
+    classDef backbone fill:#EAF7ED,stroke:#3A7D44,color:#111;
     classDef expert fill:#FFF3DF,stroke:#B67416,color:#111;
-    classDef route fill:#F3EAFF,stroke:#7550A5,color:#111;
-    classDef result fill:#FFE9ED,stroke:#A83D52,color:#111;
-    class I input;
-    class CNN,FE,FM,FD,BASE,Z0 base;
-    class TEX,MOR,COL,BND,SET,POOL,HEAD,DELTA,CAND expert;
-    class ROUTER,W route;
-    class FUSE,OUT result;
+    classDef router fill:#F3EAFF,stroke:#7550A5,color:#111;
+    classDef output fill:#FFE9ED,stroke:#A83D52,color:#111;
+    class I,RGB input;
+    class B,E,M,D backbone;
+    class T,S,SEM,C,BD,A,P,H,Z expert;
+    class R,W router;
+    class F,O output;
 ```
 
-### Specialist details
+## Expert design
 
-| Specialist | Source | Main operations | Output |
-|---|---|---|---|
-| Texture | Early backbone map | 1x1 projection, depthwise 3x3 and dilated 3x3, residual block | `FT` |
-| Morphology | Intermediate map | 1x1 projection, Sobel gradient magnitude, learned fusion, residual block | `FM` |
-| Color | Recovered RGB image | Six chromatic channels, lightweight strided CNN, projection, residual block | `FC` |
-| Boundary | Early backbone map | Gradient magnitude, horizontal/vertical flip differences, learned fusion | `FB` |
+| Expert | Input | Specialized processing | Attention | Prediction |
+|---|---|---|---|---|
+| Texture | Early feature map | Depthwise local and dilated convolutions | ECA channel attention | Complete class logits `zT` |
+| Morphology | Intermediate feature map | Learned features fused with Sobel gradient magnitude | CBAM channel-spatial attention | Complete class logits `zM` |
+| Semantic | Deep feature map | Projected high-level semantic representation | Learned channel gate | Complete class logits `zS` |
+| Color | Recovered RGB image | RGB, opponent-color differences, and color spread | SE channel attention | Complete class logits `zC` |
+| Boundary | Early feature map | Gradient magnitude and horizontal/vertical symmetry differences | Spatial attention | Complete class logits `zB` |
 
-All four maps are aligned to the intermediate feature resolution before global
-pooling. The semantic baseline is not a fifth correction expert; it is the
-protected reference prediction. The fifth router option, `w0`, means no
-correction.
+All expert maps are projected to 128 channels and aligned to the intermediate
+feature resolution. Each expert has its own classifier. Consequently, the
+semantic path is one routed expert rather than an always-on baseline, and the
+model has no separate no-correction route or additive delta-logit path.
 
-## Two-stage training protocol
+## Training objective and model selection
 
 ```mermaid
 flowchart LR
-    CKPT["Baseline checkpoint<br/>minimum validation loss"]
-    S1["Stage 1 - 10 epochs<br/>freeze baseline and router<br/>train experts + delta heads"]
-    S2["Stage 2 - up to 25 epochs<br/>freeze baseline and experts<br/>train class-aware router"]
-    TEACH["Training-only oracle teacher<br/>soft per-route gain targets"]
-    SELECT["EMA checkpoint selection<br/>minimum validation loss"]
-    TEST["Inference<br/>learned router only"]
+    Y["Ground-truth label"]
+    FINAL["Fused prediction"]
+    EX["Five expert predictions"]
+    RP["Router probabilities"]
+    EMB["Normalized expert embeddings"]
 
-    CKPT --> S1 --> S2 --> SELECT --> TEST
-    TEACH -. "training labels only" .-> S2
+    FINAL --> LF["Primary classification loss"]
+    Y --> LF
 
-    classDef frozen fill:#EAF7ED,stroke:#3A7D44,color:#111;
-    classDef train fill:#FFF3DF,stroke:#B67416,color:#111;
-    classDef oracle fill:#F3EAFF,stroke:#7550A5,color:#111;
-    classDef final fill:#EAF2FF,stroke:#3973B7,color:#111;
-    class CKPT frozen;
-    class S1,S2 train;
-    class TEACH oracle;
-    class SELECT,TEST final;
+    EX --> LE["Auxiliary expert loss<br/>mean across five experts"]
+    Y --> LE
+
+    RP --> LG["Router-gain supervision<br/>soft targets from per-expert gain"]
+    EX --> LG
+    Y --> LG
+
+    RP --> LB["Router balance regularizer"]
+    EMB --> LD["Expert diversity regularizer"]
+
+    LF --> TOTAL["Joint training objective"]
+    LE --> TOTAL
+    LG --> TOTAL
+    LB --> TOTAL
+    LD --> TOTAL
+
+    TOTAL --> EMA["EMA validation evaluation"]
+    EMA --> CKPT["Best checkpoint<br/>minimum validation loss"]
+    CKPT --> TEST["Train / validation / test reporting"]
+
+    classDef supervision fill:#EAF2FF,stroke:#3973B7,color:#111;
+    classDef loss fill:#FFF3DF,stroke:#B67416,color:#111;
+    classDef select fill:#EAF7ED,stroke:#3A7D44,color:#111;
+    class Y,FINAL,EX,RP,EMB supervision;
+    class LF,LE,LG,LB,LD,TOTAL loss;
+    class EMA,CKPT,TEST select;
 ```
+
+During training, low-probability expert dropout prevents permanent dependence
+on a single route. Router-gain targets are derived only from training labels;
+validation and test inference use only the learned router. The checkpoint used
+for final reporting is selected strictly by minimum validation loss.
 
 ## Paper notation
 
-For specialist route `i` in `{texture, morphology, color, boundary}`:
+For expert `i` in `{texture, morphology, semantic, color, boundary}`:
 
-`Fi = Expert_i(input features)`, `pi = GAP(Fi)`, and `delta zi = Head_i(pi)`.
+`Fi = Expert_i(X, Fearly, Fintermediate, Fdeep)`
 
-The router predicts five normalized weights:
+`pi = GAP(Fi)`
 
-`w = softmax(Router(evidence) / tau)`, where `sum_i wi + w0 = 1`.
+`zi = Head_i(pi)`
 
-The deployed prediction is:
+The router receives each descriptor, global expert context, pairwise cosine and
+absolute disagreement, and a learned expert-identity embedding:
 
-`z = z0 + sum_i wi * delta zi`.
+`w = softmax(Router({pi}) / tau)`, with `sum_i wi = 1`.
 
-The no-correction route has zero delta, so increasing `w0` preserves more of
-the semantic baseline. The oracle router is a training/diagnostic upper bound
-that uses known labels; it is not part of deployable validation or test
-inference.
+The deployed prediction is a convex mixture of complete expert logits:
 
-Suggested figure caption: **Class-aware residual mixture-of-experts for skin
-lesion classification. A frozen shared CNN provides the semantic baseline and
-hierarchical feature maps. Four lesion-specialized experts generate additive
-class-logit corrections. A class-aware evidence router assigns soft,
-sample-dependent weights to an explicit no-correction route and the four
-specialists. The final prediction is the immutable baseline plus the weighted
-specialist corrections.**
+`z = sum_i wi * zi`, followed by `p(y | X) = softmax(z)`.
+
+Suggested figure caption: **Attention-guided lesion-specialized mixture of
+experts with one shared CNN backbone. Hierarchical backbone features and the
+recovered RGB image feed five complementary experts with expert-specific
+attention. A disagreement-aware router assigns sample-dependent weights to
+five complete class predictions, which are fused in logit space. The network
+is trained jointly and the reported checkpoint is selected by minimum
+validation loss.**

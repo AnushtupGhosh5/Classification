@@ -97,7 +97,7 @@ def get_train_transforms(img_size=224, augment=True, augment_style="balanced"):
             transforms.RandomErasing(p=0.15, scale=(0.01, 0.08), ratio=(0.5, 2.0)),
         ])
 
-    if augment_style == "skin_focus":
+    if augment_style in ("skin_focus", "milk_pair"):
         # HAM10000/ISIC18 images are consistently 4:3 with lesions near the
         # centre. Resize the short edge and crop to square instead of warping
         # the lesion geometry from 600x450 directly into a square.
@@ -141,6 +141,17 @@ def get_val_transforms(img_size=224, augment_style="balanced"):
             transforms.Resize(img_size),
             HorizontalThreeCrop(img_size),
             transforms.Lambda(_stack_normalized_crops),
+        ])
+
+    if augment_style == "milk_pair":
+        # One deterministic view per modality. Unlike skin_focus evaluation,
+        # this intentionally avoids a crop-view dimension so a sample remains
+        # exactly [clinical, dermoscopic].
+        return transforms.Compose([
+            transforms.Resize(img_size),
+            transforms.CenterCrop(img_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
         ])
 
     scale = int(img_size * 256 / 224)  # e.g. 256 for img_size=224
