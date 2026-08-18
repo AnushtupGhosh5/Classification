@@ -25,6 +25,10 @@ def _navigate_to_backbone(model):
 def get_target_layer(model, model_name=None):
     bb = _navigate_to_backbone(model)
 
+    if model_name == "convnext_tiny":
+        # Final ConvNeXt stage, final block, spatial depthwise convolution.
+        # The later MLP layers operate channel-last and are not convolutional.
+        return bb.features[7][-1].block[0]
     if model_name in ("mobilenetv2", "mobilenetv3_small", "mobilenetv3_large"):
         return bb.features[-1][-1]
     if model_name == "densenet121":
@@ -73,6 +77,91 @@ class _DictOutputWrapper(nn.Module):
         if isinstance(out, dict):
             return out["logits"]
         return out
+
+
+class _ExpertOutputWrapper(nn.Module):
+    """Expose one expert's logits without changing the trained model."""
+
+    def __init__(self, model, expert_index):
+        super().__init__()
+        self.model = model
+        self.expert_index = int(expert_index)
+
+    def forward(self, x):
+        out = self.model(x)
+        if not isinstance(out, dict) or out.get("expert_logits") is None:
+            raise RuntimeError(
+                "Expert Grad-CAM requires model output['expert_logits']."
+            )
+        return out["expert_logits"][:, self.expert_index]
+
+
+_EXPERT_DESCRIPTIONS = {
+    "texture": "Texture / fine detail",
+    "morphology": "Morphology / lesion structure",
+    "semantic": "Semantic / deep context",
+    "color": "Color / chromatic cues",
+    "boundary": "Boundary / edge cues",
+}
+
+
+def _get_expert_target_layer(expert):
+    """Return a spatial convolution in the expert before terminal attention.
+
+    In particular, searching the entire semantic expert would select a 1x1
+    convolution inside its pooled channel gate. That is technically inside the
+    branch but cannot produce a useful spatial Grad-CAM. The residual stack is
+    the last spatial feature transform common to these experts.
+    """
+    blocks = getattr(expert, "blocks", None)
+    target = _find_deepest_conv(blocks) if blocks is not None else None
+    if target is not None:
+        return target
+    for attribute in ("project", "mix", "stages", "stem"):
+        module = getattr(expert, attribute, None)
+        target = _find_deepest_conv(module) if module is not None else None
+        if target is not None:
+            return target
+    return _find_deepest_conv(expert)
+
+
+def _collect_balanced_samples(dataloader, class_names, num_images):
+    """Collect an approximately equal, deterministic sample count per class."""
+    num_classes = len(class_names) if class_names else None
+    if not num_classes:
+        target_count = num_images
+        quotas = None
+    else:
+        # A class-balanced paper figure must not silently omit classes merely
+        # because the caller requested fewer panels than there are classes.
+        target_count = max(int(num_images), num_classes)
+        base, remainder = divmod(target_count, num_classes)
+        quotas = {
+            index: base + (1 if index < remainder else 0)
+            for index in range(num_classes)
+        }
+
+    images = []
+    labels = []
+    counts = {index: 0 for index in range(num_classes or 0)}
+    for batch in dataloader:
+        batch_images, batch_labels = batch[:2]
+        for index in range(batch_images.size(0)):
+            label = int(batch_labels[index])
+            if quotas is not None and counts[label] >= quotas[label]:
+                continue
+            image = batch_images[index]
+            if image.dim() == 4:
+                image = image[image.size(0) // 2]
+            images.append(image)
+            labels.append(label)
+            if quotas is not None:
+                counts[label] += 1
+            if len(images) >= target_count:
+                break
+        if len(images) >= target_count:
+            break
+    return images, labels
 
 
 def visualize_gradcam(
@@ -195,9 +284,14 @@ def visualize_gradcam_per_expert(
     if hasattr(model, "expert_modules"):
         names = list(getattr(model, "expert_names", model.expert_modules.keys()))
         for name in names:
-            expert_targets.append(_find_deepest_conv(model.expert_modules[name]))
+            expert_targets.append(
+                _get_expert_target_layer(model.expert_modules[name])
+            )
         if expert_names is None:
-            expert_names = [name.title() for name in names]
+            expert_names = [
+                _EXPERT_DESCRIPTIONS.get(name, name.replace("_", " ").title())
+                for name in names
+            ]
     elif hasattr(model, "semantic_branch"):
         for i, attr in enumerate(["semantic_branch", "frequency_branch", "geometry_branch"]):
             branch = getattr(model, attr)
@@ -213,60 +307,156 @@ def visualize_gradcam_per_expert(
         print("GradCAM: No expert modules found.")
         return
 
-    images_batch, labels_batch = next(iter(dataloader))
-    if images_batch.dim() == 5:
-        images_batch = images_batch[:, images_batch.size(1) // 2]
-    n = min(num_images, images_batch.size(0))
-    images_batch = images_batch[:n].to(device)
-    labels_batch = labels_batch[:n]
+    images_list, labels_list = _collect_balanced_samples(
+        dataloader, class_names, num_images,
+    )
+    if not images_list:
+        return
+    images_batch = torch.stack(images_list).to(device)
+    labels_batch = torch.tensor(labels_list, dtype=torch.long)
+    n = images_batch.size(0)
 
+    was_training = model.training
     model.eval()
-    wrapped = _DictOutputWrapper(model)
     with torch.no_grad():
-        preds = wrapped(images_batch).argmax(dim=1).cpu()
+        details = model(images_batch)
+        if not isinstance(details, dict):
+            print("GradCAM: Expert model did not return a details dictionary.")
+            model.train(was_training)
+            return
+        fused_preds = details["logits"].argmax(dim=1).cpu()
+        expert_logits = details.get("expert_logits")
+        router_weights = details.get("router_weights")
+        if expert_logits is None or router_weights is None:
+            print("GradCAM: Missing expert logits or router weights. Skipping.")
+            model.train(was_training)
+            return
+        expert_preds = expert_logits.argmax(dim=2).cpu()
+        router_weights = router_weights.detach().cpu()
 
     n_experts = len(expert_targets)
-    fig, axes = plt.subplots(n, n_experts + 1, figsize=(4 * (n_experts + 1), 4 * n))
-    if n == 1:
-        axes = axes[np.newaxis, :]
+    if expert_logits.size(1) != n_experts:
+        model.train(was_training)
+        raise RuntimeError(
+            f"Found {n_experts} expert branches but "
+            f"expert_logits has {expert_logits.size(1)} entries."
+        )
+
+    # Each wrapper returns only expert_logits[:, i]. Therefore both the score
+    # being differentiated and the hooked convolution belong to expert i.
+    expert_cams = []
+    for expert_index, target in enumerate(expert_targets):
+        if target is None:
+            expert_cams.append(None)
+            continue
+        wrapped_expert = _ExpertOutputWrapper(model, expert_index)
+        cam_input = images_batch.detach().requires_grad_(True)
+        with _GradCAM(model=wrapped_expert, target_layers=[target]) as cam_obj:
+            expert_cams.append(cam_obj(input_tensor=cam_input))
+
+    fig, axes = plt.subplots(
+        n, n_experts + 1,
+        figsize=(3.6 * (n_experts + 1), 3.5 * n),
+        squeeze=False,
+    )
 
     for i in range(n):
         img_np = _denormalize(images_batch[i].cpu())
 
         if class_names:
             t_str = class_names[labels_batch[i].item()]
-            p_str = class_names[preds[i].item()]
+            fused_str = class_names[fused_preds[i].item()]
         else:
             t_str = str(labels_batch[i].item())
-            p_str = str(preds[i].item())
+            fused_str = str(fused_preds[i].item())
 
         axes[i, 0].imshow(img_np)
-        axes[i, 0].set_title(f"Input (T:{t_str} P:{p_str})", fontsize=8)
+        axes[i, 0].set_title(
+            f"Original\nTrue: {t_str} | Fused: {fused_str}", fontsize=9,
+            color="green" if labels_batch[i] == fused_preds[i] else "red",
+        )
         axes[i, 0].axis("off")
 
-        for j, target in enumerate(expert_targets):
-            if target is None:
-                axes[i, j + 1].set_title(f"{expert_names[j]}\n(no conv)", fontsize=8)
+        for j, grayscale_cams in enumerate(expert_cams):
+            neutral_name = f"E{j + 1}"
+            description = expert_names[j]
+            if grayscale_cams is None:
+                axes[i, j + 1].set_title(
+                    f"{neutral_name} — {description}\n(no spatial conv)",
+                    fontsize=8,
+                )
                 axes[i, j + 1].axis("off")
                 continue
-
-            cam_obj = _GradCAM(model=wrapped, target_layers=[target])
-            # Expert parameters are intentionally frozen in router phase and
-            # in the selected checkpoint. Input gradients keep Grad-CAM valid
-            # without unfreezing or modifying the trained model.
-            cam_input = (
-                images_batch[i : i + 1].detach().requires_grad_(True)
+            cam_img = show_cam_on_image(
+                img_np, grayscale_cams[i], use_rgb=True,
             )
-            grayscale_cam = cam_obj(input_tensor=cam_input)
-            cam_img = show_cam_on_image(img_np, grayscale_cam[0], use_rgb=True)
-
+            expert_pred = int(expert_preds[i, j])
+            expert_pred_str = (
+                class_names[expert_pred] if class_names else str(expert_pred)
+            )
             axes[i, j + 1].imshow(cam_img)
-            axes[i, j + 1].set_title(expert_names[j], fontsize=8)
+            axes[i, j + 1].set_title(
+                f"{neutral_name} — {description}\n"
+                f"Pred: {expert_pred_str} | Router: {router_weights[i, j]:.3f}",
+                fontsize=8,
+            )
             axes[i, j + 1].axis("off")
 
-    plt.suptitle(f"Expert GradCAM - {model_label}", fontsize=12, y=1.02)
+    plt.suptitle(
+        "Expert-specific Grad-CAM (each map uses its own expert logits)",
+        fontsize=14, y=1.002,
+    )
     plt.tight_layout()
-    path = os.path.join(save_dir, f"{model_label}_expert_gradcam.png")
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    path = os.path.join(
+        save_dir, f"{model_label}_expert_specific_gradcam.png",
+    )
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
-    print(f"Saved expert GradCAM: {path}")
+    print(f"Saved expert-specific GradCAM: {path}")
+
+    # The overall decision is differentiated from the final fused logits. Use
+    # every expert's spatial target: a deep-backbone-only target would exclude
+    # the early/intermediate experts and the independent chromatic path.
+    fused_targets = [target for target in expert_targets if target is not None]
+    if not fused_targets:
+        print("GradCAM: Could not find fused-model expert target layers.")
+        model.train(was_training)
+        return
+    wrapped_fused = _DictOutputWrapper(model)
+    fused_input = images_batch.detach().requires_grad_(True)
+    with _GradCAM(model=wrapped_fused, target_layers=fused_targets) as cam_obj:
+        fused_cams = cam_obj(input_tensor=fused_input)
+
+    fused_fig, fused_axes = plt.subplots(
+        n, 2, figsize=(8, 3.5 * n), squeeze=False,
+    )
+    for index in range(n):
+        image = _denormalize(images_batch[index].cpu())
+        true_index = labels_batch[index].item()
+        pred_index = fused_preds[index].item()
+        true_name = class_names[true_index] if class_names else str(true_index)
+        pred_name = class_names[pred_index] if class_names else str(pred_index)
+        title = f"True: {true_name} | Pred: {pred_name}"
+        title_color = "green" if true_index == pred_index else "red"
+        fused_axes[index, 0].imshow(image)
+        fused_axes[index, 0].set_title(f"Original\n{title}", fontsize=9, color=title_color)
+        fused_axes[index, 0].axis("off")
+        fused_axes[index, 1].imshow(
+            show_cam_on_image(image, fused_cams[index], use_rgb=True),
+        )
+        fused_axes[index, 1].set_title(
+            f"Final fused-model Grad-CAM (E1–E{n_experts})\n{title}",
+            fontsize=9, color=title_color,
+        )
+        fused_axes[index, 1].axis("off")
+    fused_fig.suptitle(
+        "Final fused-model Grad-CAM (out['logits'])", fontsize=14, y=1.002,
+    )
+    fused_fig.tight_layout()
+    fused_path = os.path.join(
+        save_dir, f"{model_label}_final_fused_gradcam.png",
+    )
+    fused_fig.savefig(fused_path, dpi=300, bbox_inches="tight")
+    plt.close(fused_fig)
+    model.train(was_training)
+    print(f"Saved final fused-model GradCAM: {fused_path}")

@@ -12,7 +12,12 @@ from src.utils import (
     extract_features,
     forward_with_tta,
 )
-from src.visualize import plot_confusion_matrix, plot_roc_auc, plot_tsne
+from src.visualize import (
+    plot_confusion_matrix,
+    plot_expert_comparison,
+    plot_roc_auc,
+    plot_tsne,
+)
 from src.gradcam import visualize_gradcam, visualize_gradcam_per_expert
 
 
@@ -89,6 +94,7 @@ def run_expert_diagnostics(model, val_loader, test_loader, device, num_classes,
         with open(path, "w") as file:
             json.dump(reports, file, indent=2)
         print(f"Saved expert diagnostics: {path}")
+        plot_expert_comparison(reports, save_dir, model_label)
     return reports or None
 
 

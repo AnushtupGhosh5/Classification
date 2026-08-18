@@ -97,6 +97,26 @@ def get_train_transforms(img_size=224, augment=True, augment_style="balanced"):
             transforms.RandomErasing(p=0.15, scale=(0.01, 0.08), ratio=(0.5, 2.0)),
         ])
 
+    if augment_style == "pad_clinical":
+        # PAD-UFES-20 contains smartphone clinical photographs rather than
+        # consistently framed dermoscopy. A small resize-and-crop supplies the
+        # crop/zoom regularisation used by published PAD pipelines while
+        # retaining at least ~91% of each image dimension. Avoid the old large
+        # translations and RandomErasing, which can remove small lesions.
+        crop_scale = int(round(img_size * 1.10))
+        return transforms.Compose([
+            transforms.Resize((crop_scale, crop_scale)),
+            transforms.RandomCrop(img_size),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            RandomRightAngleRotation(),
+            transforms.ColorJitter(
+                brightness=0.08, contrast=0.10, saturation=0.08, hue=0.01,
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
+        ])
+
     if augment_style in ("skin_focus", "milk_pair"):
         # HAM10000/ISIC18 images are consistently 4:3 with lesions near the
         # centre. Resize the short edge and crop to square instead of warping
@@ -129,7 +149,7 @@ def get_train_transforms(img_size=224, augment=True, augment_style="balanced"):
 
 def get_val_transforms(img_size=224, augment_style="balanced"):
     """Deterministic eval transform matched to the training resize policy."""
-    if augment_style in ("seefnet", "skin"):
+    if augment_style in ("seefnet", "skin", "pad_clinical"):
         return transforms.Compose([
             transforms.Resize((img_size, img_size)),
             transforms.ToTensor(),

@@ -1,5 +1,6 @@
 /data
 outputs/
+.torch-cache/
 **/__pycache__/
 Expert Fusion.md
 .venv

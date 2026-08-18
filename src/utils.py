@@ -205,6 +205,78 @@ def evaluate_model(model, dataloader, criterion, device, num_classes, tta=False)
 
 
 @torch.no_grad()
+def calibrate_router_temperature(
+    model, dataloader, criterion, device, num_classes, temperatures,
+    tta=False,
+):
+    """Select a soft-router temperature using validation loss only.
+
+    This is post-training calibration: model parameters and architecture are
+    untouched. The selected value remains installed on ``model.router`` for
+    the subsequent locked-split evaluation.
+    """
+    router = getattr(model, "router", None)
+    if router is None or not hasattr(router, "temperature"):
+        raise ValueError(
+            "Router-temperature calibration requires a model exposing "
+            "model.router.temperature"
+        )
+    if getattr(router, "routing_mode", "soft") != "soft":
+        raise ValueError(
+            "Router-temperature calibration is only valid for soft routing"
+        )
+
+    candidates = tuple(float(value) for value in temperatures)
+    if not candidates or any(value <= 0 for value in candidates):
+        raise ValueError("All router-temperature candidates must be positive")
+    # Avoid evaluating duplicate temperatures while preserving the declared
+    # order in the saved protocol record.
+    candidates = tuple(dict.fromkeys(candidates))
+    original = float(router.temperature)
+    reports = []
+    best = None
+    try:
+        for temperature in candidates:
+            router.temperature = temperature
+            metrics, _ = evaluate_model(
+                model, dataloader, criterion, device, num_classes, tta=tta,
+            )
+            report = {
+                "temperature": temperature,
+                "loss": float(metrics["loss"]),
+                "accuracy": float(metrics["accuracy"]),
+                "f1": float(metrics["f1"]),
+                "balanced_accuracy": float(metrics["balanced_accuracy"]),
+                "router_entropy": metrics.get("router_entropy"),
+            }
+            reports.append(report)
+            # The research selection rule is strictly minimum validation
+            # loss. Ties prefer the least change from the trained setting.
+            key = (
+                report["loss"],
+                abs(np.log(temperature / original)),
+                temperature,
+            )
+            if best is None or key < best["key"]:
+                best = {"key": key, "report": report}
+    except Exception:
+        router.temperature = original
+        raise
+
+    selected = float(best["report"]["temperature"])
+    router.temperature = selected
+    return {
+        "selection_split": "validation",
+        "selection_metric": "minimum_validation_loss",
+        "architecture_or_weights_changed": False,
+        "original_temperature": original,
+        "selected_temperature": selected,
+        "selected_validation_metrics": best["report"],
+        "candidates": reports,
+    }
+
+
+@torch.no_grad()
 def compute_expert_diagnostics(model, dataloader, device, num_classes,
                                class_names=None, tta=False):
     """Collect standalone expert and sample-level routing diagnostics."""

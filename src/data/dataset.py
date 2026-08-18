@@ -6,6 +6,8 @@ from PIL import Image, UnidentifiedImageError
 from torch.utils.data import Dataset
 from sklearn.model_selection import train_test_split
 
+from src.data.group_split import greedy_group_stratified_split
+
 
 VALID_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
@@ -44,7 +46,22 @@ def create_splits(
     train_sampling_strategy="balanced_random",
     validate_images=False,
     fallback_val_from_train=False,
+    split_strategy=None,
+    metadata_csv=None,
+    images_dir=None,
+    val_fraction=0.15,
+    test_fraction=0.15,
 ):
+    if split_strategy == "pad_ufes20_patient":
+        return create_pad_ufes20_splits(
+            metadata_csv,
+            images_dir,
+            class_names,
+            seed=seed,
+            val_fraction=val_fraction,
+            test_fraction=test_fraction,
+            validate_images=validate_images,
+        )
     if has_predefined_splits:
         return _create_predefined_splits(
             data_dir,
@@ -57,6 +74,105 @@ def create_splits(
             fallback_val_from_train=fallback_val_from_train,
         )
     return _create_random_splits(data_dir, num_classes, class_names, seed, validate_images)
+
+
+def create_pad_ufes20_splits(
+    metadata_csv,
+    images_dir,
+    class_names,
+    seed=42,
+    val_fraction=0.15,
+    test_fraction=0.15,
+    validate_images=True,
+):
+    """Create image-only PAD-UFES-20 splits grouped by patient.
+
+    Only ``img_id``, ``diagnostic``, and ``patient_id`` are read. Clinical
+    metadata is deliberately excluded from model inputs and split balancing.
+    """
+    if not metadata_csv or not os.path.isfile(metadata_csv):
+        raise FileNotFoundError(f"PAD-UFES-20 metadata CSV not found: {metadata_csv}")
+    if not images_dir or not os.path.isdir(images_dir):
+        raise FileNotFoundError(f"PAD-UFES-20 images directory not found: {images_dir}")
+    if val_fraction <= 0 or test_fraction <= 0:
+        raise ValueError("PAD-UFES-20 validation/test fractions must be positive")
+    if val_fraction + test_fraction >= 1:
+        raise ValueError("PAD-UFES-20 validation + test fractions must be below 1")
+
+    image_paths = {}
+    duplicates = set()
+    for root, _directories, filenames in os.walk(images_dir):
+        for filename in filenames:
+            if os.path.splitext(filename)[1].lower() not in VALID_EXTENSIONS:
+                continue
+            path = os.path.join(root, filename)
+            if filename in image_paths:
+                duplicates.add(filename)
+            image_paths[filename] = path
+    if duplicates:
+        preview = ", ".join(sorted(duplicates)[:5])
+        raise ValueError(f"Duplicate PAD-UFES-20 image basenames: {preview}")
+
+    class_to_idx = {name: index for index, name in enumerate(class_names)}
+    records = []
+    missing_images = []
+    with open(metadata_csv, newline="", encoding="utf-8-sig") as file:
+        reader = csv.DictReader(file)
+        required = {"img_id", "diagnostic", "patient_id"}
+        missing_columns = required - set(reader.fieldnames or ())
+        if missing_columns:
+            raise ValueError(
+                f"PAD-UFES-20 metadata is missing columns {sorted(missing_columns)}"
+            )
+        for row in reader:
+            diagnosis = row["diagnostic"].strip()
+            if diagnosis not in class_to_idx:
+                raise ValueError(f"Unexpected PAD-UFES-20 diagnosis: {diagnosis}")
+            image_id = row["img_id"].strip()
+            path = image_paths.get(image_id)
+            if path is None:
+                missing_images.append(image_id)
+                continue
+            records.append((path, class_to_idx[diagnosis], row["patient_id"].strip()))
+    if missing_images:
+        preview = ", ".join(missing_images[:5])
+        raise FileNotFoundError(
+            f"PAD-UFES-20 is missing {len(missing_images)} metadata images; "
+            f"examples: {preview}"
+        )
+
+    train_fraction = 1.0 - val_fraction - test_fraction
+    grouped = greedy_group_stratified_split(
+        records,
+        len(class_names),
+        (train_fraction, val_fraction, test_fraction),
+        seed=seed,
+    )
+    train_grouped, val_grouped, test_grouped = grouped
+    train_samples = [(path, label) for path, label, _patient in train_grouped]
+    val_samples = [(path, label) for path, label, _patient in val_grouped]
+    test_samples = [(path, label) for path, label, _patient in test_grouped]
+    train_samples = _filter_invalid_images(train_samples, "Train", validate_images)
+    val_samples = _filter_invalid_images(val_samples, "Val", validate_images)
+    test_samples = _filter_invalid_images(test_samples, "Test", validate_images)
+
+    _print_split_counts("Train", train_samples, len(class_names))
+    _print_split_counts("Val", val_samples, len(class_names))
+    _print_split_counts("Test", test_samples, len(class_names))
+    patient_sets = [
+        {record[2] for record in partition} for partition in grouped
+    ]
+    if (
+        patient_sets[0] & patient_sets[1]
+        or patient_sets[0] & patient_sets[2]
+        or patient_sets[1] & patient_sets[2]
+    ):
+        raise RuntimeError("PAD-UFES-20 patient leakage audit failed")
+    print(
+        "  PAD-UFES-20 image-only protocol: metadata features excluded; "
+        "0 patient IDs cross splits"
+    )
+    return train_samples, val_samples, test_samples
 
 
 def _create_random_splits(data_dir, num_classes, class_names, seed, validate_images=False):

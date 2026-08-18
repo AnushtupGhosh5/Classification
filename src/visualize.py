@@ -51,6 +51,60 @@ def plot_training_curves(history, save_dir, model_label):
     print(f"Saved training curves: {path}")
 
 
+def plot_expert_comparison(reports, save_dir, model_label):
+    """Visualize routing and standalone quality for every active expert."""
+    available = [name for name in ("validation", "test") if name in reports]
+    if not available:
+        return
+    fig, axes = plt.subplots(
+        len(available), 3, figsize=(15, 4.5 * len(available)), squeeze=False,
+    )
+    colors = {
+        "texture": "#4C78A8",
+        "morphology": "#F58518",
+        "semantic": "#54A24B",
+        "color": "#E45756",
+        "boundary": "#B279A2",
+    }
+    for row, split_name in enumerate(available):
+        report = reports[split_name]
+        names = list(report["routing"])
+        palette = [colors.get(name, "#777777") for name in names]
+        values = (
+            [report["routing"][name]["mean_weight"] for name in names],
+            [report["standalone_experts"][name]["f1"] for name in names],
+            [
+                report["standalone_experts"][name]["balanced_accuracy"]
+                for name in names
+            ],
+        )
+        titles = (
+            "Mean router weight", "Standalone macro F1", "Standalone BAcc",
+        )
+        for column, (metric_values, title) in enumerate(zip(values, titles)):
+            ax = axes[row, column]
+            bars = ax.bar(names, metric_values, color=palette)
+            ax.set_ylim(0.0, 1.0)
+            ax.set_title(f"{split_name.title()}: {title}")
+            ax.tick_params(axis="x", rotation=25)
+            ax.grid(axis="y", alpha=0.25)
+            for bar, value in zip(bars, metric_values):
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    value + 0.015,
+                    f"{value:.3f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                )
+    fig.suptitle("Active Expert Comparison", fontsize=14)
+    fig.tight_layout()
+    path = os.path.join(save_dir, f"{model_label}_expert_comparison.png")
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved expert comparison: {path}")
+
+
 def plot_confusion_matrix(y_true, y_pred, class_names, save_dir, model_label):
     os.makedirs(save_dir, exist_ok=True)
 

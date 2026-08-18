@@ -58,7 +58,10 @@ from src.losses import (
     SymmetricCrossEntropyLoss,
 )
 from src.train import train_model
-from src.utils import calibrate_static_expert_fusion
+from src.utils import (
+    calibrate_router_temperature,
+    calibrate_static_expert_fusion,
+)
 from src.evaluate import (
     evaluate_all_splits,
     run_expert_diagnostics,
@@ -66,6 +69,7 @@ from src.evaluate import (
     run_test_evaluation,
 )
 from src.visualize import plot_training_curves
+from src.gradcam import visualize_gradcam_per_expert
 
 
 MODEL_REGISTRY = {
@@ -121,6 +125,11 @@ def get_data_loaders(
     use_weighted_sampler=False,
     sampler_mode="equal",
     augment_style="balanced",
+    split_strategy=None,
+    metadata_csv=None,
+    images_dir=None,
+    val_fraction=0.15,
+    test_fraction=0.15,
 ):
     train_samples, val_samples, test_samples = create_splits(
         data_dir, num_classes, class_names=class_names,
@@ -130,6 +139,11 @@ def get_data_loaders(
         train_sampling_strategy=train_sampling_strategy,
         validate_images=validate_images,
         fallback_val_from_train=fallback_val_from_train,
+        split_strategy=split_strategy,
+        metadata_csv=metadata_csv,
+        images_dir=images_dir,
+        val_fraction=val_fraction,
+        test_fraction=test_fraction,
     )
 
     train_dataset = FolderDataset(
@@ -382,6 +396,26 @@ def main():
     parser.add_argument("--router-hidden", type=int, default=128)
     parser.add_argument("--router-dropout", type=float, default=0.1)
     parser.add_argument("--router-temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--enabled-experts", nargs="+",
+        choices=["texture", "morphology", "semantic", "color", "boundary"],
+        default=["texture", "morphology", "semantic", "color", "boundary"],
+        help="Active branches for five_expert_moe ablation runs",
+    )
+    parser.add_argument(
+        "--calibrate-router-temperature",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Post-training soft-router temperature calibration selected "
+            "strictly by minimum validation loss"
+        ),
+    )
+    parser.add_argument(
+        "--router-temperature-grid", type=float, nargs="+",
+        default=(0.25, 0.4, 0.55, 0.7, 0.9, 1.2, 1.6),
+        help="Validation-only temperature candidates for soft routing",
+    )
     parser.add_argument("--router-lr-scale", type=float, default=1.0,
                         help="Router learning rate as a multiplier of --lr")
     parser.add_argument("--disagreement-scale", type=float, default=1.0)
@@ -545,8 +579,12 @@ def main():
                         help="Defer all official-test evaluation and report validation only")
     parser.add_argument("--evaluate-only", action="store_true",
                         help="Load this run's existing minimum-validation-loss checkpoint and evaluate without retraining")
+    parser.add_argument(
+        "--expert-visualization-only", action="store_true",
+        help="With --evaluate-only, load the locked checkpoint and generate only expert Grad-CAM artifacts",
+    )
     parser.add_argument("--augment-style", type=str, default=None,
-                        choices=["balanced", "seefnet", "skin", "skin_focus", "milk_pair"],
+                        choices=["balanced", "seefnet", "skin", "skin_focus", "pad_clinical", "milk_pair"],
                         help="Override the dataset's image augmentation policy")
     parser.add_argument("--weighted-sampler", action=argparse.BooleanOptionalAction,
                         default=None,
@@ -592,6 +630,11 @@ def main():
     train_sampling_strategy = config.get("train_sampling_strategy", "balanced_random")
     validate_images = config.get("validate_images", False)
     fallback_val_from_train = config.get("fallback_val_from_train", False)
+    split_strategy = config.get("split_strategy")
+    metadata_csv = config.get("metadata_csv")
+    images_dir = config.get("images_dir")
+    val_fraction = config.get("val_fraction", 0.15)
+    test_fraction = config.get("test_fraction", 0.15)
 
     # Dataset-specific training overrides (e.g. ISIC17 enables EMA / early
     # stopping / grad clipping to keep the validation loss well-behaved on its
@@ -683,6 +726,11 @@ def main():
             use_weighted_sampler=use_weighted_sampler,
             sampler_mode=sampler_mode,
             augment_style=augment_style,
+            split_strategy=split_strategy,
+            metadata_csv=metadata_csv,
+            images_dir=images_dir,
+            val_fraction=val_fraction,
+            test_fraction=test_fraction,
         )
 
     is_vit = args.model in VIT_MODELS
@@ -700,7 +748,7 @@ def main():
         if args.model == "five_expert_moe":
             print(
                 f"Backbone: {args.backbone1} | Routed complete experts: "
-                f"texture/morphology/semantic/color/boundary | "
+                f"{'/'.join(args.enabled_experts)} | "
                 f"Routing: {args.routing_mode} | "
                 f"Expert attention: {args.expert_attention}"
             )
@@ -825,6 +873,8 @@ def main():
             residual_kwargs["classifier_dropout"] = args.classifier_dropout
             if args.model == "paired_lesion_moe":
                 residual_kwargs["paired_baseline_only"] = args.paired_baseline_only
+            elif args.model == "five_expert_moe":
+                residual_kwargs["enabled_experts"] = args.enabled_experts
         model, head_name = residual_factory(**residual_kwargs)
     elif is_expert_fusion:
         expert_kwargs = dict(
@@ -1099,6 +1149,8 @@ def main():
         parser.error("--router-dropout must be in [0, 1)")
     if args.router_temperature <= 0:
         parser.error("--router-temperature must be positive")
+    if any(value <= 0 for value in args.router_temperature_grid):
+        parser.error("--router-temperature-grid values must be positive")
     if args.router_lr_scale <= 0:
         parser.error("--router-lr-scale must be positive")
     if es_patience < 1:
@@ -1246,6 +1298,47 @@ def main():
         print(f"\nLoading best model from {best_model_path}")
         model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
         restore_protected_baseline()
+
+    if args.expert_visualization_only:
+        if not args.evaluate_only:
+            parser.error("--expert-visualization-only requires --evaluate-only")
+        if evaluation_test_loader is None:
+            parser.error("Expert visualization requires an available test loader")
+        if not hasattr(model, "expert_names"):
+            parser.error("The selected model does not expose expert branches")
+        visualize_gradcam_per_expert(
+            model, evaluation_test_loader, device, results_dir, model_label,
+            num_images=6, class_names=class_names,
+        )
+        print("\nExpert visualization complete; metrics were not re-evaluated.")
+        return
+
+    if args.calibrate_router_temperature:
+        calibration = calibrate_router_temperature(
+            model, val_loader, criterion, device, num_classes,
+            temperatures=args.router_temperature_grid, tta=eval_tta,
+        )
+        os.makedirs(results_dir, exist_ok=True)
+        calibration_path = os.path.join(
+            results_dir, f"{model_label}_router_temperature_calibration.json",
+        )
+        with open(calibration_path, "w") as file:
+            json.dump(calibration, file, indent=2)
+        print("\nVALIDATION-LOSS ROUTER TEMPERATURE CALIBRATION:")
+        for candidate in calibration["candidates"]:
+            print(
+                f"  T={candidate['temperature']:.3g} | "
+                f"loss={candidate['loss']:.4f} | "
+                f"Acc={candidate['accuracy']:.4f} | "
+                f"F1={candidate['f1']:.4f} | "
+                f"BAcc={candidate['balanced_accuracy']:.4f}"
+            )
+        print(
+            "  Selected T="
+            f"{calibration['selected_temperature']:.3g} by minimum "
+            "validation loss"
+        )
+        print(f"Saved router-temperature calibration: {calibration_path}")
 
     if args.static_fusion_calibration:
         calibration = calibrate_static_expert_fusion(

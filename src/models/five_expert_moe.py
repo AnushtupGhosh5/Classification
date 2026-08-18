@@ -37,9 +37,7 @@ class ExpertClassifier(nn.Module):
 
 
 class FiveExpertLesionMoE(nn.Module):
-    """Route five complete lesion-specialized predictions per image."""
-
-    expert_names = EXPERT_NAMES
+    """Route a declared subset of lesion-specialized predictions per image."""
 
     def __init__(
         self,
@@ -58,8 +56,20 @@ class FiveExpertLesionMoE(nn.Module):
         router_balance_weight=0.001,
         expert_dropout=0.05,
         classifier_dropout=0.25,
+        enabled_experts=EXPERT_NAMES,
     ):
         super().__init__()
+        requested = tuple(str(name).lower() for name in enabled_experts)
+        unknown = sorted(set(requested) - set(EXPERT_NAMES))
+        if unknown:
+            raise ValueError(f"Unknown five-expert ablation names: {unknown}")
+        if len(requested) != len(set(requested)):
+            raise ValueError("enabled_experts must not contain duplicates")
+        self.expert_names = tuple(
+            name for name in EXPERT_NAMES if name in requested
+        )
+        if len(self.expert_names) < 2:
+            raise ValueError("At least two experts are required for MoE routing")
         self.feature_pyramid = HierarchicalBackbone(backbone_name, pretrained)
         self._backbone_module_name = "feature_pyramid"
         self.expert_loss_weight = float(expert_aux_weight)
@@ -74,23 +84,26 @@ class FiveExpertLesionMoE(nn.Module):
         early_channels, intermediate_channels, deep_channels = (
             self.feature_pyramid.channels
         )
-        self.expert_modules = nn.ModuleDict({
-            "texture": TextureExpert(
+        available_modules = {
+            "texture": lambda: TextureExpert(
                 early_channels, proj_dim, branch_depth, expert_attention,
             ),
-            "morphology": MorphologyExpert(
+            "morphology": lambda: MorphologyExpert(
                 intermediate_channels, proj_dim, branch_depth,
                 expert_attention,
             ),
-            "semantic": SemanticExpert(
+            "semantic": lambda: SemanticExpert(
                 deep_channels, proj_dim, branch_depth,
             ),
-            "color": ColorExpert(
+            "color": lambda: ColorExpert(
                 proj_dim, branch_depth, expert_attention,
             ),
-            "boundary": BoundaryExpert(
+            "boundary": lambda: BoundaryExpert(
                 early_channels, proj_dim, branch_depth, expert_attention,
             ),
+        }
+        self.expert_modules = nn.ModuleDict({
+            name: available_modules[name]() for name in self.expert_names
         })
         self.router = DisagreementAwareRouter(
             proj_dim=proj_dim,
@@ -143,15 +156,28 @@ class FiveExpertLesionMoE(nn.Module):
             )
         early, intermediate, deep = self.feature_pyramid(images)
         common_size = intermediate.shape[-2:]
-        features = [
-            self.expert_modules["texture"](early, common_size),
-            self.expert_modules["morphology"](intermediate, common_size),
-            self.expert_modules["semantic"](deep, common_size),
-            self.expert_modules["color"](
+        features_by_name = {}
+        if "texture" in self.expert_modules:
+            features_by_name["texture"] = self.expert_modules["texture"](
+                early, common_size,
+            )
+        if "morphology" in self.expert_modules:
+            features_by_name["morphology"] = self.expert_modules["morphology"](
+                intermediate, common_size,
+            )
+        if "semantic" in self.expert_modules:
+            features_by_name["semantic"] = self.expert_modules["semantic"](
+                deep, common_size,
+            )
+        if "color" in self.expert_modules:
+            features_by_name["color"] = self.expert_modules["color"](
                 self._recover_rgb(images), common_size,
-            ),
-            self.expert_modules["boundary"](early, common_size),
-        ]
+            )
+        if "boundary" in self.expert_modules:
+            features_by_name["boundary"] = self.expert_modules["boundary"](
+                early, common_size,
+            )
+        features = [features_by_name[name] for name in self.expert_names]
         pooled = torch.stack([
             F.adaptive_avg_pool2d(feature, 1).flatten(1)
             for feature in features
@@ -166,12 +192,11 @@ class FiveExpertLesionMoE(nn.Module):
             weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
 
         expert_logits = self.head(pooled)
-        semantic_logits = expert_logits[:, 2]
         logits = (weights.unsqueeze(-1) * expert_logits).sum(dim=1)
         aux_loss = logits.new_zeros(())
         if self.training:
             aux_loss = self._structural_loss(probabilities, comparison)
-        return {
+        result = {
             "logits": logits,
             "expert_logits": expert_logits,
             "router_weights": weights,
@@ -179,11 +204,12 @@ class FiveExpertLesionMoE(nn.Module):
             "router_active": (weights.detach() > 0).to(weights.dtype),
             "expert_embeddings": comparison,
             "expert_disagreement": disagreement,
-            # Router-gain supervision treats the semantic expert as the
-            # matched non-routed reference and learns when another expert helps.
-            "baseline_logits": semantic_logits,
             "aux_loss": aux_loss,
         }
+        if "semantic" in self.expert_names:
+            semantic_index = self.expert_names.index("semantic")
+            result["baseline_logits"] = expert_logits[:, semantic_index]
+        return result
 
 
 def create_five_expert_moe(
@@ -206,6 +232,7 @@ def create_five_expert_moe(
     router_gain_weight=0.0,
     router_gain_temperature=0.25,
     router_lr_scale=1.0,
+    enabled_experts=EXPERT_NAMES,
     **_unused,
 ):
     model = FiveExpertLesionMoE(
@@ -224,6 +251,7 @@ def create_five_expert_moe(
         router_balance_weight=router_balance_weight,
         expert_dropout=expert_dropout,
         classifier_dropout=classifier_dropout,
+        enabled_experts=enabled_experts,
     )
     model.router_gain_loss_weight = float(router_gain_weight)
     model.router_gain_temperature = float(router_gain_temperature)

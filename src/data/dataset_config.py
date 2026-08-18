@@ -47,6 +47,47 @@ DATASET_REGISTRY = {
         "num_classes": 5,
         "has_predefined_splits": True,
     },
+    "pad_ufes20": {
+        "data_dir": os.path.join(_DATA_ROOT, "PAD-UFES-20_classification"),
+        "images_dir": os.path.join(
+            _DATA_ROOT, "PAD-UFES-20_classification", "images",
+        ),
+        "metadata_csv": os.path.join(
+            _DATA_ROOT, "PAD-UFES-20_classification", "metadata.csv",
+        ),
+        "class_names": ["ACK", "BCC", "MEL", "NEV", "SCC", "SEK"],
+        "num_classes": 6,
+        "has_predefined_splits": False,
+        "split_strategy": "pad_ufes20_patient",
+        "val_fraction": 0.15,
+        "test_fraction": 0.15,
+        "validate_images": True,
+        "training_overrides": {
+            # PAD-specific mild crop/zoom without destructive translation or
+            # erasing. Use one mild loss correction rather than combining it
+            # with replacement sampling and over-correcting minority classes.
+            "augment_style": "pad_clinical",
+            "use_weighted_sampler": False,
+            "sampler_mode": "sqrt",
+            "class_weight_power": 0.25,
+            "freeze_epochs": 0,
+            "scheduler": "cosine",
+            "loss": "ce",
+            "label_smoothing": 0.05,
+            "classifier_dropout": 0.30,
+            "lr": 1e-4,
+            "weight_decay": 1e-4,
+            "img_size": 384,
+            "mixup_alpha": 0.2,
+            "mix_prob": 0.25,
+            "ema": True,
+            "ema_decay": 0.999,
+            "early_stopping": True,
+            "es_patience": 15,
+            "es_min_delta": 0.0,
+            "tta": True,
+        },
+    },
     "milk10k": {
         "data_dir": os.path.join(
             _DATA_ROOT,
