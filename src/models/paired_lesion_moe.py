@@ -102,7 +102,6 @@ class ExpertClassifier(nn.Module):
 
 
 class PairedLesionMoE(nn.Module):
-    expert_names = EXPERT_NAMES
     paired_input = True
 
     def __init__(
@@ -123,8 +122,22 @@ class PairedLesionMoE(nn.Module):
         expert_dropout=0.0,
         classifier_dropout=0.25,
         baseline_only=False,
+        enabled_experts=EXPERT_NAMES,
     ):
         super().__init__()
+        requested = tuple(str(name).lower() for name in enabled_experts)
+        unknown = sorted(set(requested) - set(EXPERT_NAMES))
+        if unknown:
+            raise ValueError(f"Unknown paired expert ablation names: {unknown}")
+        if len(requested) != len(set(requested)):
+            raise ValueError("enabled_experts must not contain duplicates")
+        self.expert_names = tuple(
+            name for name in EXPERT_NAMES if name in requested
+        )
+        if len(self.expert_names) < 2:
+            raise ValueError("At least two paired experts are required")
+        if baseline_only and "semantic" not in self.expert_names:
+            raise ValueError("paired baseline-only mode requires semantic expert")
         self.feature_pyramid = HierarchicalBackbone(backbone_name, pretrained)
         self._backbone_module_name = "feature_pyramid"
         self.backbone_name = backbone_name
@@ -146,22 +159,25 @@ class PairedLesionMoE(nn.Module):
         )
 
         early_channels, intermediate_channels, deep_channels = self.feature_pyramid.channels
-        self.expert_modules = nn.ModuleDict({
-            "texture": TextureExpert(
+        available_modules = {
+            "texture": lambda: TextureExpert(
                 early_channels, proj_dim, branch_depth, expert_attention,
             ),
-            "morphology": MorphologyExpert(
+            "morphology": lambda: MorphologyExpert(
                 intermediate_channels, proj_dim, branch_depth, expert_attention,
             ),
-            "semantic": PairedSemanticExpert(
+            "semantic": lambda: PairedSemanticExpert(
                 deep_channels, proj_dim, branch_depth,
             ),
-            "color": PairedColorExpert(
+            "color": lambda: PairedColorExpert(
                 proj_dim, branch_depth, expert_attention,
             ),
-            "boundary": BoundaryExpert(
+            "boundary": lambda: BoundaryExpert(
                 early_channels, proj_dim, branch_depth, expert_attention,
             ),
+        }
+        self.expert_modules = nn.ModuleDict({
+            name: available_modules[name]() for name in self.expert_names
         })
         self.router = DisagreementAwareRouter(
             proj_dim=proj_dim,
@@ -216,21 +232,30 @@ class PairedLesionMoE(nn.Module):
 
         clinical_rgb = self._recover_rgb(clinical)
         dermoscopic_rgb = self._recover_rgb(dermoscopic)
-        features = [
+        features_by_name = {}
+        if "texture" in self.expert_modules:
             # Dermoscopy preserves the local microstructure needed here.
-            self.expert_modules["texture"](dermoscopic_early, common_size),
-            self.expert_modules["morphology"](
+            features_by_name["texture"] = self.expert_modules["texture"](
+                dermoscopic_early, common_size,
+            )
+        if "morphology" in self.expert_modules:
+            features_by_name["morphology"] = self.expert_modules["morphology"](
                 dermoscopic_intermediate, common_size,
-            ),
-            self.expert_modules["semantic"](
+            )
+        if "semantic" in self.expert_modules:
+            features_by_name["semantic"] = self.expert_modules["semantic"](
                 clinical_deep, dermoscopic_deep, common_size,
-            ),
-            self.expert_modules["color"](
+            )
+        if "color" in self.expert_modules:
+            features_by_name["color"] = self.expert_modules["color"](
                 clinical_rgb, dermoscopic_rgb, common_size,
-            ),
+            )
+        if "boundary" in self.expert_modules:
             # Clinical framing retains useful macroscopic border/asymmetry.
-            self.expert_modules["boundary"](clinical_early, common_size),
-        ]
+            features_by_name["boundary"] = self.expert_modules["boundary"](
+                clinical_early, common_size,
+            )
+        features = [features_by_name[name] for name in self.expert_names]
         pooled = torch.stack([
             F.adaptive_avg_pool2d(feature, 1).flatten(1) for feature in features
         ], dim=1)
@@ -244,17 +269,19 @@ class PairedLesionMoE(nn.Module):
             weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
 
         expert_logits = self.head(pooled)
-        # The control path is exactly the semantic expert from this same model,
-        # so paired baseline versus MoE comparisons do not confound classifiers.
-        baseline_logits = expert_logits[:, 2]
-        logits = (
-            baseline_logits if self.baseline_only
-            else (weights.unsqueeze(-1) * expert_logits).sum(dim=1)
-        )
+        logits = (weights.unsqueeze(-1) * expert_logits).sum(dim=1)
+        baseline_logits = None
+        if "semantic" in self.expert_names:
+            # The control path is exactly the semantic expert from this same
+            # model, so paired baseline comparisons do not confound heads.
+            semantic_index = self.expert_names.index("semantic")
+            baseline_logits = expert_logits[:, semantic_index]
+            if self.baseline_only:
+                logits = baseline_logits
         aux_loss = logits.new_zeros(())
         if self.training and not self.baseline_only:
             aux_loss = self._structural_loss(probabilities, comparison)
-        return {
+        result = {
             "logits": logits,
             "expert_logits": expert_logits,
             "router_weights": weights,
@@ -262,9 +289,11 @@ class PairedLesionMoE(nn.Module):
             "router_active": (weights.detach() > 0).to(weights.dtype),
             "expert_embeddings": comparison,
             "expert_disagreement": disagreement,
-            "baseline_logits": baseline_logits,
             "aux_loss": aux_loss,
         }
+        if baseline_logits is not None:
+            result["baseline_logits"] = baseline_logits
+        return result
 
 
 def create_paired_lesion_moe(
@@ -288,6 +317,7 @@ def create_paired_lesion_moe(
     router_gain_weight=0.0,
     router_gain_temperature=0.25,
     router_lr_scale=1.0,
+    enabled_experts=EXPERT_NAMES,
     **_unused,
 ):
     model = PairedLesionMoE(
@@ -307,6 +337,7 @@ def create_paired_lesion_moe(
         expert_dropout=expert_dropout,
         classifier_dropout=classifier_dropout,
         baseline_only=paired_baseline_only,
+        enabled_experts=enabled_experts,
     )
     model.router_gain_loss_weight = float(router_gain_weight)
     model.router_gain_temperature = float(router_gain_temperature)

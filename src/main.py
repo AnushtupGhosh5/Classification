@@ -558,6 +558,14 @@ def main():
                         help="Initialize backbone weights from a plain or nested fusion checkpoint")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--milk-split-seed", type=int, default=None,
+        help=(
+            "Fixed lesion-split seed for paired MILK10k runs. Defaults to "
+            "--seed; set it separately when repeating training on the exact "
+            "same train/validation/test lesions."
+        ),
+    )
     parser.add_argument("--amp", action="store_true",
                         help="Use mixed precision (FP16) training to reduce GPU memory")
     parser.add_argument("--mixup-alpha", type=float, default=0.0,
@@ -702,10 +710,17 @@ def main():
                 f"using milk_pair transforms instead of {augment_style}."
             )
             augment_style = "milk_pair"
+        milk_split_seed = (
+            args.seed if args.milk_split_seed is None else args.milk_split_seed
+        )
+        print(
+            f"MILK10k reproducibility: split seed={milk_split_seed} | "
+            f"training seed={args.seed}"
+        )
         train_loader, train_eval_loader, val_loader, test_loader = (
             get_milk10k_paired_loaders(
                 config, class_names, args.batch_size, img_size,
-                args.num_workers, args.seed, use_weighted_sampler,
+                args.num_workers, milk_split_seed, use_weighted_sampler,
                 sampler_mode, augment_style, args.milk_val_fraction,
                 args.milk_local_test_fraction,
             )
@@ -755,12 +770,20 @@ def main():
         elif args.model in (
             "lesion_moe", "oracle_moe", "paired_lesion_moe",
         ):
-            print(
-                f"Semantic baseline: {args.backbone1} | Complementary experts: "
-                f"texture/morphology/color/boundary | Routing: {args.routing_mode} | "
-                f"Fusion space: {args.lesion_fusion_space} | "
-                f"Expert attention: {args.expert_attention}"
-            )
+            if args.model == "paired_lesion_moe":
+                print(
+                    f"Paired shared backbone: {args.backbone1} | Routed experts: "
+                    f"{'/'.join(args.enabled_experts)} | "
+                    f"Routing: {args.routing_mode} | "
+                    f"Expert attention: {args.expert_attention}"
+                )
+            else:
+                print(
+                    f"Semantic baseline: {args.backbone1} | Complementary experts: "
+                    f"texture/morphology/color/boundary | Routing: {args.routing_mode} | "
+                    f"Fusion space: {args.lesion_fusion_space} | "
+                    f"Expert attention: {args.expert_attention}"
+                )
         elif args.expert_mode == "multi_layer":
             print(f"Expert mode: multi_layer | Backbone: {args.backbone1}")
         else:
@@ -873,6 +896,7 @@ def main():
             residual_kwargs["classifier_dropout"] = args.classifier_dropout
             if args.model == "paired_lesion_moe":
                 residual_kwargs["paired_baseline_only"] = args.paired_baseline_only
+                residual_kwargs["enabled_experts"] = args.enabled_experts
             elif args.model == "five_expert_moe":
                 residual_kwargs["enabled_experts"] = args.enabled_experts
         model, head_name = residual_factory(**residual_kwargs)

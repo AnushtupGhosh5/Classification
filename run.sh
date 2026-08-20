@@ -13,6 +13,7 @@ TORCH_CACHE_DIR="$PROJECT_DIR/.torch-cache"
 mkdir -p "$OUTPUT_DIR/models" "$OUTPUT_DIR/results" "$TORCH_CACHE_DIR"
 
 docker run --rm --gpus all --shm-size=8g --network host \
+    -e RUN_PAD -e RUN_MILK \
     -v "$DATA_DIR:/app/data" \
     -v "$SRC_DIR:/app/src" \
     -v "$OUTPUT_DIR:/app/outputs" \
