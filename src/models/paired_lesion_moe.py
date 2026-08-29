@@ -121,6 +121,7 @@ class PairedLesionMoE(nn.Module):
         router_balance_weight=0.002,
         expert_dropout=0.0,
         classifier_dropout=0.25,
+        router_adaptive_strength=1.0,
         baseline_only=False,
         enabled_experts=EXPERT_NAMES,
     ):
@@ -150,6 +151,7 @@ class PairedLesionMoE(nn.Module):
         self.expert_diversity_weight = float(expert_diversity_weight)
         self.router_balance_weight = float(router_balance_weight)
         self.expert_dropout = float(expert_dropout)
+        self.router_adaptive_strength = float(router_adaptive_strength)
         self.router_full_lr = True
         self.router_gain_loss_weight = 0.0
         self.router_gain_temperature = 0.25
@@ -260,6 +262,12 @@ class PairedLesionMoE(nn.Module):
             F.adaptive_avg_pool2d(feature, 1).flatten(1) for feature in features
         ], dim=1)
         weights, probabilities, comparison, disagreement = self.router(pooled)
+        if self.router_adaptive_strength < 1.0:
+            uniform = torch.full_like(weights, 1.0 / weights.size(1))
+            weights = (
+                self.router_adaptive_strength * weights
+                + (1.0 - self.router_adaptive_strength) * uniform
+            )
         if self.training and self.expert_dropout > 0:
             keep = torch.rand_like(weights) >= self.expert_dropout
             empty = ~keep.any(dim=1)
@@ -317,6 +325,7 @@ def create_paired_lesion_moe(
     router_gain_weight=0.0,
     router_gain_temperature=0.25,
     router_lr_scale=1.0,
+    router_adaptive_strength=1.0,
     enabled_experts=EXPERT_NAMES,
     **_unused,
 ):
@@ -336,6 +345,7 @@ def create_paired_lesion_moe(
         router_balance_weight=router_balance_weight,
         expert_dropout=expert_dropout,
         classifier_dropout=classifier_dropout,
+        router_adaptive_strength=router_adaptive_strength,
         baseline_only=paired_baseline_only,
         enabled_experts=enabled_experts,
     )

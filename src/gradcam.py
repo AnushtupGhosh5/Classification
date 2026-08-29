@@ -96,6 +96,14 @@ class _ExpertOutputWrapper(nn.Module):
         return out["expert_logits"][:, self.expert_index]
 
 
+class _PairedGradCAM(_GradCAM):
+    """Treat ``[B, 2, C, H, W]`` as paired 2D images, not 3D volumes."""
+
+    @staticmethod
+    def get_target_width_height(input_tensor):
+        return input_tensor.size(-1), input_tensor.size(-2)
+
+
 _EXPERT_DESCRIPTIONS = {
     "texture": "Texture / fine detail",
     "morphology": "Morphology / lesion structure",
@@ -113,6 +121,16 @@ def _get_expert_target_layer(expert):
     branch but cannot produce a useful spatial Grad-CAM. The residual stack is
     the last spatial feature transform common to these experts.
     """
+    # Paired MILK experts wrap one shared feature processor and then gate its
+    # clinical/dermoscopic outputs. Recurse into that processor so the hooked
+    # convolution is spatial and belongs to the expert, rather than falling
+    # through to a pooled modality gate.
+    shared = getattr(expert, "shared", None)
+    if shared is not None:
+        target = _get_expert_target_layer(shared)
+        if target is not None:
+            return target
+
     blocks = getattr(expert, "blocks", None)
     target = _find_deepest_conv(blocks) if blocks is not None else None
     if target is not None:
@@ -125,7 +143,9 @@ def _get_expert_target_layer(expert):
     return _find_deepest_conv(expert)
 
 
-def _collect_balanced_samples(dataloader, class_names, num_images):
+def _collect_balanced_samples(
+    dataloader, class_names, num_images, paired_input=False,
+):
     """Collect an approximately equal, deterministic sample count per class."""
     num_classes = len(class_names) if class_names else None
     if not num_classes:
@@ -151,7 +171,7 @@ def _collect_balanced_samples(dataloader, class_names, num_images):
             if quotas is not None and counts[label] >= quotas[label]:
                 continue
             image = batch_images[index]
-            if image.dim() == 4:
+            if image.dim() == 4 and not paired_input:
                 image = image[image.size(0) // 2]
             images.append(image)
             labels.append(label)
@@ -307,8 +327,10 @@ def visualize_gradcam_per_expert(
         print("GradCAM: No expert modules found.")
         return
 
+    paired_input = bool(getattr(model, "paired_input", False))
+    gradcam_class = _PairedGradCAM if paired_input else _GradCAM
     images_list, labels_list = _collect_balanced_samples(
-        dataloader, class_names, num_images,
+        dataloader, class_names, num_images, paired_input=paired_input,
     )
     if not images_list:
         return
@@ -351,7 +373,9 @@ def visualize_gradcam_per_expert(
             continue
         wrapped_expert = _ExpertOutputWrapper(model, expert_index)
         cam_input = images_batch.detach().requires_grad_(True)
-        with _GradCAM(model=wrapped_expert, target_layers=[target]) as cam_obj:
+        with gradcam_class(
+            model=wrapped_expert, target_layers=[target],
+        ) as cam_obj:
             expert_cams.append(cam_obj(input_tensor=cam_input))
 
     fig, axes = plt.subplots(
@@ -361,7 +385,13 @@ def visualize_gradcam_per_expert(
     )
 
     for i in range(n):
-        img_np = _denormalize(images_batch[i].cpu())
+        if paired_input:
+            clinical_np = _denormalize(images_batch[i, 0].cpu())
+            dermoscopic_np = _denormalize(images_batch[i, 1].cpu())
+            original_np = np.concatenate((clinical_np, dermoscopic_np), axis=1)
+        else:
+            img_np = _denormalize(images_batch[i].cpu())
+            original_np = img_np
 
         if class_names:
             t_str = class_names[labels_batch[i].item()]
@@ -370,9 +400,12 @@ def visualize_gradcam_per_expert(
             t_str = str(labels_batch[i].item())
             fused_str = str(fused_preds[i].item())
 
-        axes[i, 0].imshow(img_np)
+        axes[i, 0].imshow(original_np)
         axes[i, 0].set_title(
-            f"Original\nTrue: {t_str} | Fused: {fused_str}", fontsize=9,
+            (
+                "Original: Clinical | Dermoscopic\n"
+                if paired_input else "Original\n"
+            ) + f"True: {t_str} | Fused: {fused_str}", fontsize=9,
             color="green" if labels_batch[i] == fused_preds[i] else "red",
         )
         axes[i, 0].axis("off")
@@ -387,9 +420,33 @@ def visualize_gradcam_per_expert(
                 )
                 axes[i, j + 1].axis("off")
                 continue
-            cam_img = show_cam_on_image(
-                img_np, grayscale_cams[i], use_rgb=True,
-            )
+            if paired_input and len(grayscale_cams) == 2 * n:
+                # Paired semantic/color processors evaluate the same expert
+                # convolution for clinical samples followed by dermoscopic
+                # samples. Preserve both modality-specific CAMs.
+                clinical_cam = show_cam_on_image(
+                    clinical_np, grayscale_cams[i], use_rgb=True,
+                )
+                dermoscopic_cam = show_cam_on_image(
+                    dermoscopic_np, grayscale_cams[n + i], use_rgb=True,
+                )
+                cam_img = np.concatenate(
+                    (clinical_cam, dermoscopic_cam), axis=1,
+                )
+                modality_note = "Clinical | Dermoscopic"
+            elif paired_input:
+                expert_key = names[j] if j < len(names) else ""
+                use_clinical = expert_key == "boundary"
+                base_image = clinical_np if use_clinical else dermoscopic_np
+                cam_img = show_cam_on_image(
+                    base_image, grayscale_cams[i], use_rgb=True,
+                )
+                modality_note = "Clinical" if use_clinical else "Dermoscopic"
+            else:
+                cam_img = show_cam_on_image(
+                    img_np, grayscale_cams[i], use_rgb=True,
+                )
+                modality_note = ""
             expert_pred = int(expert_preds[i, j])
             expert_pred_str = (
                 class_names[expert_pred] if class_names else str(expert_pred)
@@ -397,7 +454,8 @@ def visualize_gradcam_per_expert(
             axes[i, j + 1].imshow(cam_img)
             axes[i, j + 1].set_title(
                 f"{neutral_name} — {description}\n"
-                f"Pred: {expert_pred_str} | Router: {router_weights[i, j]:.3f}",
+                + (f"{modality_note}\n" if modality_note else "")
+                + f"Pred: {expert_pred_str} | Router: {router_weights[i, j]:.3f}",
                 fontsize=8,
             )
             axes[i, j + 1].axis("off")
@@ -423,32 +481,94 @@ def visualize_gradcam_per_expert(
         model.train(was_training)
         return
     wrapped_fused = _DictOutputWrapper(model)
-    fused_input = images_batch.detach().requires_grad_(True)
-    with _GradCAM(model=wrapped_fused, target_layers=fused_targets) as cam_obj:
-        fused_cams = cam_obj(input_tensor=fused_input)
+    if paired_input:
+        # Expert targets do not all have the same activation batch dimension:
+        # texture/morphology/boundary see one modality (N), while the shared
+        # semantic/color processors see both modalities (2N). Compute each
+        # final-logit CAM independently and aggregate per modality.
+        clinical_maps = []
+        dermoscopic_maps = []
+        for expert_index, target in enumerate(expert_targets):
+            if target is None:
+                continue
+            fused_input = images_batch.detach().requires_grad_(True)
+            with gradcam_class(
+                model=wrapped_fused, target_layers=[target],
+            ) as cam_obj:
+                target_cams = cam_obj(input_tensor=fused_input)
+            if len(target_cams) == 2 * n:
+                clinical_maps.append(target_cams[:n])
+                dermoscopic_maps.append(target_cams[n:])
+            elif names[expert_index] == "boundary":
+                clinical_maps.append(target_cams)
+            else:
+                dermoscopic_maps.append(target_cams)
 
+        def aggregate_maps(maps):
+            if not maps:
+                return np.zeros((n, *images_batch.shape[-2:]), dtype=np.float32)
+            combined = np.mean(np.stack(maps, axis=0), axis=0)
+            flat = combined.reshape(n, -1)
+            minimum = flat.min(axis=1)[:, None, None]
+            maximum = flat.max(axis=1)[:, None, None]
+            return (combined - minimum) / np.maximum(maximum - minimum, 1e-8)
+
+        clinical_fused_cams = aggregate_maps(clinical_maps)
+        dermoscopic_fused_cams = aggregate_maps(dermoscopic_maps)
+    else:
+        fused_input = images_batch.detach().requires_grad_(True)
+        with gradcam_class(
+            model=wrapped_fused, target_layers=fused_targets,
+        ) as cam_obj:
+            fused_cams = cam_obj(input_tensor=fused_input)
+
+    fused_columns = 4 if paired_input else 2
     fused_fig, fused_axes = plt.subplots(
-        n, 2, figsize=(8, 3.5 * n), squeeze=False,
+        n, fused_columns, figsize=(4 * fused_columns, 3.5 * n), squeeze=False,
     )
     for index in range(n):
-        image = _denormalize(images_batch[index].cpu())
+        if paired_input:
+            clinical = _denormalize(images_batch[index, 0].cpu())
+            dermoscopic = _denormalize(images_batch[index, 1].cpu())
+        else:
+            image = _denormalize(images_batch[index].cpu())
         true_index = labels_batch[index].item()
         pred_index = fused_preds[index].item()
         true_name = class_names[true_index] if class_names else str(true_index)
         pred_name = class_names[pred_index] if class_names else str(pred_index)
         title = f"True: {true_name} | Pred: {pred_name}"
         title_color = "green" if true_index == pred_index else "red"
-        fused_axes[index, 0].imshow(image)
-        fused_axes[index, 0].set_title(f"Original\n{title}", fontsize=9, color=title_color)
-        fused_axes[index, 0].axis("off")
-        fused_axes[index, 1].imshow(
-            show_cam_on_image(image, fused_cams[index], use_rgb=True),
-        )
-        fused_axes[index, 1].set_title(
-            f"Final fused-model Grad-CAM (E1–E{n_experts})\n{title}",
-            fontsize=9, color=title_color,
-        )
-        fused_axes[index, 1].axis("off")
+        if paired_input:
+            panels = (
+                (clinical, "Original clinical"),
+                (show_cam_on_image(
+                    clinical, clinical_fused_cams[index], use_rgb=True,
+                ), "Fused decision — clinical evidence"),
+                (dermoscopic, "Original dermoscopic"),
+                (show_cam_on_image(
+                    dermoscopic, dermoscopic_fused_cams[index], use_rgb=True,
+                ), "Fused decision — dermoscopic evidence"),
+            )
+            for column, (panel, heading) in enumerate(panels):
+                fused_axes[index, column].imshow(panel)
+                fused_axes[index, column].set_title(
+                    f"{heading}\n{title}", fontsize=9, color=title_color,
+                )
+                fused_axes[index, column].axis("off")
+        else:
+            fused_axes[index, 0].imshow(image)
+            fused_axes[index, 0].set_title(
+                f"Original\n{title}", fontsize=9, color=title_color,
+            )
+            fused_axes[index, 0].axis("off")
+            fused_axes[index, 1].imshow(
+                show_cam_on_image(image, fused_cams[index], use_rgb=True),
+            )
+            fused_axes[index, 1].set_title(
+                f"Final fused-model Grad-CAM (E1–E{n_experts})\n{title}",
+                fontsize=9, color=title_color,
+            )
+            fused_axes[index, 1].axis("off")
     fused_fig.suptitle(
         "Final fused-model Grad-CAM (out['logits'])", fontsize=14, y=1.002,
     )

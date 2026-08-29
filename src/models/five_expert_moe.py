@@ -56,6 +56,8 @@ class FiveExpertLesionMoE(nn.Module):
         router_balance_weight=0.001,
         expert_dropout=0.05,
         classifier_dropout=0.25,
+        router_adaptive_strength=1.0,
+        router_use_disagreement=True,
         enabled_experts=EXPERT_NAMES,
     ):
         super().__init__()
@@ -77,6 +79,7 @@ class FiveExpertLesionMoE(nn.Module):
         self.expert_diversity_weight = float(expert_diversity_weight)
         self.router_balance_weight = float(router_balance_weight)
         self.expert_dropout = float(expert_dropout)
+        self.router_adaptive_strength = float(router_adaptive_strength)
         self.router_full_lr = True
         self.router_gain_loss_weight = 0.0
         self.router_gain_temperature = 0.25
@@ -112,6 +115,7 @@ class FiveExpertLesionMoE(nn.Module):
             dropout=router_dropout,
             temperature=router_temperature,
             routing_mode=routing_mode,
+            use_disagreement=router_use_disagreement,
         )
         self.head = ExpertClassifier(
             proj_dim, num_classes, len(self.expert_names), classifier_dropout,
@@ -183,6 +187,12 @@ class FiveExpertLesionMoE(nn.Module):
             for feature in features
         ], dim=1)
         weights, probabilities, comparison, disagreement = self.router(pooled)
+        if self.router_adaptive_strength < 1.0:
+            uniform = torch.full_like(weights, 1.0 / weights.size(1))
+            weights = (
+                self.router_adaptive_strength * weights
+                + (1.0 - self.router_adaptive_strength) * uniform
+            )
         if self.training and self.expert_dropout > 0:
             keep = torch.rand_like(weights) >= self.expert_dropout
             empty = ~keep.any(dim=1)
@@ -232,6 +242,8 @@ def create_five_expert_moe(
     router_gain_weight=0.0,
     router_gain_temperature=0.25,
     router_lr_scale=1.0,
+    router_adaptive_strength=1.0,
+    router_use_disagreement=True,
     enabled_experts=EXPERT_NAMES,
     **_unused,
 ):
@@ -251,6 +263,8 @@ def create_five_expert_moe(
         router_balance_weight=router_balance_weight,
         expert_dropout=expert_dropout,
         classifier_dropout=classifier_dropout,
+        router_adaptive_strength=router_adaptive_strength,
+        router_use_disagreement=router_use_disagreement,
         enabled_experts=enabled_experts,
     )
     model.router_gain_loss_weight = float(router_gain_weight)

@@ -1,141 +1,97 @@
-# Attention-Guided Five-Expert Lesion MoE
+# Proposed Architecture
 
-## Inference architecture
+The paper uses neutral branch identifiers E1–E5. Descriptions below state the
+implemented operations, not guaranteed or exclusive semantic roles.
+
+## Inference path
 
 ```mermaid
 flowchart LR
-    I["Input lesion image<br/>256 x 256"]
-    B["One shared CNN backbone<br/>ConvNeXt-Tiny"]
-    E["Early feature map"]
-    M["Intermediate feature map"]
-    D["Deep feature map"]
-    RGB["Recovered RGB image<br/>range 0 to 1"]
+    X["Input image"] --> B["Shared ConvNeXt-Tiny"]
+    X --> R["Recovered RGB view"]
+    B --> L["Early features"]
+    B --> M["Intermediate features"]
+    B --> H["Deep features"]
 
-    I --> B
-    I --> RGB
-    B --> E
-    B --> M
-    B --> D
+    L --> E1["E1<br/>multi-scale convolutions + ECA"]
+    M --> E2["E2<br/>learned and gradient cues + CBAM"]
+    H --> E3["E3<br/>deep projection + channel gate"]
+    R --> E4["E4<br/>chromatic transform + SE"]
+    L --> E5["E5<br/>gradient/reflection cues + spatial attention"]
 
-    E --> T["Texture expert<br/>local + dilated filters<br/>ECA attention"]
-    M --> S["Morphology expert<br/>learned + Sobel cues<br/>CBAM attention"]
-    D --> SEM["Semantic expert<br/>deep features<br/>channel gate"]
-    RGB --> C["Color expert<br/>chromatic channels<br/>SE attention"]
-    E --> BD["Boundary expert<br/>gradient + symmetry cues<br/>spatial attention"]
+    E1 --> P["Align + global pooling"]
+    E2 --> P
+    E3 --> P
+    E4 --> P
+    E5 --> P
 
-    T --> A["Align feature maps<br/>to intermediate resolution"]
-    S --> A
-    SEM --> A
-    C --> A
-    BD --> A
-
-    A --> P["Global average pooling<br/>five 128-D descriptors"]
-    P --> H["Five independent heads<br/>LayerNorm + Dropout + Linear"]
-    H --> Z["Complete expert logits<br/>zT, zM, zS, zC, zB"]
-
-    P --> R["Disagreement-aware router<br/>descriptor + global context<br/>cosine/absolute disagreement<br/>expert identity"]
-    R --> W["Soft sample-wise weights<br/>wT, wM, wS, wC, wB"]
-
-    Z --> F["Weighted logit fusion<br/>z = sum wi zi"]
+    P --> C["Five independent classifiers"]
+    P --> D["Disagreement-aware router"]
+    C --> Z["Branch logits z1 ... z5"]
+    D --> W["Image-dependent weights w1 ... w5"]
+    Z --> F["Weighted logit fusion"]
     W --> F
-    F --> O["Softmax<br/>final class probabilities"]
+    F --> Y["Final class probabilities"]
 
-    classDef input fill:#EAF2FF,stroke:#3973B7,color:#111;
-    classDef backbone fill:#EAF7ED,stroke:#3A7D44,color:#111;
-    classDef expert fill:#FFF3DF,stroke:#B67416,color:#111;
-    classDef router fill:#F3EAFF,stroke:#7550A5,color:#111;
-    classDef output fill:#FFE9ED,stroke:#A83D52,color:#111;
-    class I,RGB input;
-    class B,E,M,D backbone;
-    class T,S,SEM,C,BD,A,P,H,Z expert;
-    class R,W router;
-    class F,O output;
+    classDef input fill:#eaf2ff,stroke:#3973b7,color:#111;
+    classDef backbone fill:#eaf7ed,stroke:#3a7d44,color:#111;
+    classDef branch fill:#fff3df,stroke:#b67416,color:#111;
+    classDef router fill:#f3eaff,stroke:#7550a5,color:#111;
+    classDef output fill:#ffe9ed,stroke:#a83d52,color:#111;
+    class X,R input;
+    class B,L,M,H backbone;
+    class E1,E2,E3,E4,E5,P,C,Z branch;
+    class D,W router;
+    class F,Y output;
 ```
 
-## Expert design
+E4 receives a recovered, de-normalized RGB view directly from the model input;
+it does not come from a ConvNeXt feature layer. The other branches receive
+hierarchical maps from the one shared backbone.
 
-| Expert | Input | Specialized processing | Attention | Prediction |
-|---|---|---|---|---|
-| Texture | Early feature map | Depthwise local and dilated convolutions | ECA channel attention | Complete class logits `zT` |
-| Morphology | Intermediate feature map | Learned features fused with Sobel gradient magnitude | CBAM channel-spatial attention | Complete class logits `zM` |
-| Semantic | Deep feature map | Projected high-level semantic representation | Learned channel gate | Complete class logits `zS` |
-| Color | Recovered RGB image | RGB, opponent-color differences, and color spread | SE channel attention | Complete class logits `zC` |
-| Boundary | Early feature map | Gradient magnitude and horizontal/vertical symmetry differences | Spatial attention | Complete class logits `zB` |
+## Mathematical summary
 
-All expert maps are projected to 128 channels and aligned to the intermediate
-feature resolution. Each expert has its own classifier. Consequently, the
-semantic path is one routed expert rather than an always-on baseline, and the
-model has no separate no-correction route or additive delta-logit path.
+Let the shared backbone provide hierarchical maps
 
-## Training objective and model selection
+\[
+(F^{(e)},F^{(m)},F^{(d)})=B(x).
+\]
 
-```mermaid
-flowchart LR
-    Y["Ground-truth label"]
-    FINAL["Fused prediction"]
-    EX["Five expert predictions"]
-    RP["Router probabilities"]
-    EMB["Normalized expert embeddings"]
+Each branch implements a distinct transformation and produces a descriptor and
+complete class prediction:
 
-    FINAL --> LF["Primary classification loss"]
-    Y --> LF
+\[
+h_i=\operatorname{GAP}(E_i(x,F^{(e)},F^{(m)},F^{(d)})),\qquad
+z_i=H_i(h_i).
+\]
 
-    EX --> LE["Auxiliary expert loss<br/>mean across five experts"]
-    Y --> LE
+The router uses all descriptors and their learned disagreement representation:
 
-    RP --> LG["Router-gain supervision<br/>soft targets from per-expert gain"]
-    EX --> LG
-    Y --> LG
+\[
+w=\operatorname{softmax}(R(h_1,\ldots,h_5)/\tau),
+\qquad \sum_{i=1}^{5}w_i=1.
+\]
 
-    RP --> LB["Router balance regularizer"]
-    EMB --> LD["Expert diversity regularizer"]
+The deployed classifier is a convex mixture in logit space:
 
-    LF --> TOTAL["Joint training objective"]
-    LE --> TOTAL
-    LG --> TOTAL
-    LB --> TOTAL
-    LD --> TOTAL
+\[
+z=\sum_{i=1}^{5}w_i z_i,
+\qquad p(y\mid x)=\operatorname{softmax}(z).
+\]
 
-    TOTAL --> EMA["EMA validation evaluation"]
-    EMA --> CKPT["Best checkpoint<br/>minimum validation loss"]
-    CKPT --> TEST["Train / validation / test reporting"]
+The primary loss supervises the fused logits. Auxiliary branch supervision and
+small balance/diversity regularizers are controlled by command-line arguments,
+not dataset-specific constants embedded in the architecture. The reported
+checkpoint is selected by minimum validation loss.
 
-    classDef supervision fill:#EAF2FF,stroke:#3973B7,color:#111;
-    classDef loss fill:#FFF3DF,stroke:#B67416,color:#111;
-    classDef select fill:#EAF7ED,stroke:#3A7D44,color:#111;
-    class Y,FINAL,EX,RP,EMB supervision;
-    class LF,LE,LG,LB,LD,TOTAL loss;
-    class EMA,CKPT,TEST select;
-```
+## Interpretation figures
 
-During training, low-probability expert dropout prevents permanent dependence
-on a single route. Router-gain targets are derived only from training labels;
-validation and test inference use only the learned router. The checkpoint used
-for final reporting is selected strictly by minimum validation loss.
+Two distinct figures should be reported:
 
-## Paper notation
+1. Expert-specific Grad-CAM, where branch `Ei` is explained using its own
+   logits and a target layer inside that branch.
+2. Final-model Grad-CAM, where the fused logits are explained to visualize the
+   deployed decision.
 
-For expert `i` in `{texture, morphology, semantic, color, boundary}`:
-
-`Fi = Expert_i(X, Fearly, Fintermediate, Fdeep)`
-
-`pi = GAP(Fi)`
-
-`zi = Head_i(pi)`
-
-The router receives each descriptor, global expert context, pairwise cosine and
-absolute disagreement, and a learned expert-identity embedding:
-
-`w = softmax(Router({pi}) / tau)`, with `sum_i wi = 1`.
-
-The deployed prediction is a convex mixture of complete expert logits:
-
-`z = sum_i wi * zi`, followed by `p(y | X) = softmax(z)`.
-
-Suggested figure caption: **Attention-guided lesion-specialized mixture of
-experts with one shared CNN backbone. Hierarchical backbone features and the
-recovered RGB image feed five complementary experts with expert-specific
-attention. A disagreement-aware router assigns sample-dependent weights to
-five complete class predictions, which are fused in logit space. The network
-is trained jointly and the reported checkpoint is selected by minimum
-validation loss.**
+These visualizations can demonstrate different evidence patterns, but they do
+not prove that a branch corresponds uniquely to a named clinical concept.

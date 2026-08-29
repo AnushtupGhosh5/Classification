@@ -2,9 +2,11 @@ import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import random
 import numpy as np
 import torch
 import json
+from torch.utils.data import DataLoader, Subset
 from src.utils import (
     compute_expert_diagnostics,
     compute_oracle_diagnostics,
@@ -19,6 +21,316 @@ from src.visualize import (
     plot_tsne,
 )
 from src.gradcam import visualize_gradcam, visualize_gradcam_per_expert
+
+
+PAPER_EXPERT_ORDER = (
+    ("E1", "texture"),
+    ("E2", "morphology"),
+    ("E3", "semantic"),
+    ("E4", "color"),
+    ("E5", "boundary"),
+)
+
+
+@torch.no_grad()
+def export_router_sanity_check(
+    model,
+    test_loader,
+    device,
+    class_names,
+    save_dir,
+    model_label,
+    samples_per_class=5,
+    seed=42,
+):
+    """Export per-image routing weights for a balanced test subset."""
+    if not hasattr(model, "expert_names"):
+        raise ValueError("Router sanity check requires an expert-routing model")
+    if test_loader is None or len(test_loader.dataset) == 0:
+        raise ValueError("Router sanity check requires a non-empty test split")
+    if not hasattr(test_loader.dataset, "samples"):
+        raise ValueError("Test dataset does not expose image paths via .samples")
+    if samples_per_class <= 0:
+        raise ValueError("samples_per_class must be positive")
+
+    samples = test_loader.dataset.samples
+    indices_by_class = {index: [] for index in range(len(class_names))}
+    for index, sample in enumerate(samples):
+        _path, label = sample[:2]
+        indices_by_class[int(label)].append(index)
+
+    rng = random.Random(seed)
+    selected_indices = []
+    for class_index, class_name in enumerate(class_names):
+        candidates = list(indices_by_class[class_index])
+        if len(candidates) < samples_per_class:
+            raise ValueError(
+                f"Class {class_name} has only {len(candidates)} test images; "
+                f"cannot select {samples_per_class}"
+            )
+        rng.shuffle(candidates)
+        selected_indices.extend(sorted(candidates[:samples_per_class]))
+
+    selected_loader = DataLoader(
+        Subset(test_loader.dataset, selected_indices),
+        batch_size=min(test_loader.batch_size or 1, len(selected_indices)),
+        shuffle=False,
+        num_workers=0,
+        pin_memory=bool(getattr(test_loader, "pin_memory", False)),
+    )
+
+    internal_names = tuple(model.expert_names)
+    missing = [name for _label, name in PAPER_EXPERT_ORDER if name not in internal_names]
+    if missing:
+        raise ValueError(f"Checkpoint is missing required experts: {missing}")
+    paper_columns = [
+        (paper_label, name, internal_names.index(name))
+        for paper_label, name in PAPER_EXPERT_ORDER
+    ]
+
+    model.eval()
+    rows = []
+    offset = 0
+    for images, labels in selected_loader:
+        images = images.to(device)
+        result = model(images)
+        if not isinstance(result, dict) or result.get("router_weights") is None:
+            raise ValueError("Model forward pass did not return router_weights")
+        predictions = result["logits"].argmax(dim=1)
+        weights = result["router_weights"]
+
+        for batch_index in range(images.size(0)):
+            dataset_index = selected_indices[offset + batch_index]
+            image_path, stored_label = samples[dataset_index][:2]
+            true_index = int(labels[batch_index])
+            if true_index != int(stored_label):
+                raise RuntimeError("Selected test image/label alignment failed")
+            row = {
+                "image_path": image_path,
+                "image_name": os.path.basename(image_path),
+                "true_class": class_names[true_index],
+                "predicted_class": class_names[int(predictions[batch_index])],
+                "correct": int(predictions[batch_index]) == true_index,
+            }
+            for paper_label, _name, internal_index in paper_columns:
+                row[paper_label] = float(
+                    weights[batch_index, internal_index].cpu()
+                )
+            row["weight_sum"] = sum(
+                row[paper_label]
+                for paper_label, _name, _internal_index in paper_columns
+            )
+            rows.append(row)
+        offset += images.size(0)
+
+    weight_fields = [paper_label for paper_label, _name, _index in paper_columns]
+    os.makedirs(save_dir, exist_ok=True)
+    summary_rows = []
+    for class_name in class_names:
+        class_rows = [row for row in rows if row["true_class"] == class_name]
+        summary = {"true_class": class_name, "samples": len(class_rows)}
+        for field in weight_fields:
+            values = np.asarray([row[field] for row in class_rows], dtype=np.float64)
+            summary[f"mean_{field}"] = float(values.mean())
+            summary[f"std_{field}"] = float(values.std(ddof=0))
+        summary_rows.append(summary)
+
+    report_path = os.path.join(save_dir, f"{model_label}_router_sanity.md")
+    report = [
+        "# Router sanity check",
+        "",
+        "E1–E5 are neutral branch identifiers in the model's implemented order. "
+        "They do not assert that a branch has learned a particular clinical concept.",
+        "",
+        "## Class-wise routing weights",
+        "",
+        "| True class | Samples | " + " | ".join(weight_fields) + " |",
+        "|---|---:|" + "---:|" * len(weight_fields),
+    ]
+    for summary in summary_rows:
+        cells = [
+            f"{summary[f'mean_{field}']:.4f} ± {summary[f'std_{field}']:.4f}"
+            for field in weight_fields
+        ]
+        report.append(
+            f"| {summary['true_class']} | {summary['samples']} | "
+            + " | ".join(cells) + " |"
+        )
+    report.extend([
+        "",
+        "## Per-image routing weights",
+        "",
+        "| Image | True | Predicted | Correct | "
+        + " | ".join(weight_fields) + " | Sum |",
+        "|---|---|---|:---:|" + "---:|" * (len(weight_fields) + 1),
+    ])
+    for row in rows:
+        weights = " | ".join(f"{row[field]:.6f}" for field in weight_fields)
+        report.append(
+            f"| {row['image_name']} | {row['true_class']} | "
+            f"{row['predicted_class']} | {'yes' if row['correct'] else 'no'} | "
+            f"{weights} | {row['weight_sum']:.6f} |"
+        )
+    with open(report_path, "w", encoding="utf-8") as file:
+        file.write("\n".join(report) + "\n")
+
+    print("\nROUTER SANITY CHECK (five deterministic test images per class):")
+    print(
+        "  Branch order: E1, E2, E3, E4, E5 (neutral labels)"
+    )
+    print("\n  Per-image routing weights:")
+    for row in rows:
+        values = " | ".join(
+            f"{paper_label}={row[paper_label]:.6f}"
+            for paper_label, _name, _index in paper_columns
+        )
+        print(
+            f"  {row['true_class']:<4} | {row['image_name']:<24} | "
+            f"pred={row['predicted_class']:<4} | {values} | "
+            f"sum={row['weight_sum']:.6f}"
+        )
+
+    print("\n  Class-wise mean routing weights:")
+    for summary in summary_rows:
+        means = " | ".join(
+            f"{paper_label}={summary[f'mean_{paper_label}']:.4f}"
+            for paper_label, _name, _index in paper_columns
+        )
+        print(f"  {summary['true_class']:<4} mean: {means}")
+    print(f"Saved router report: {report_path}")
+    return {"rows": rows, "class_summary": summary_rows}
+
+
+@torch.no_grad()
+def export_router_repeatability_check(
+    model,
+    test_loader,
+    device,
+    class_names,
+    save_dir,
+    model_label,
+    class_name="MEL",
+    repeats=20,
+    seed=42,
+):
+    """Forward one fixed test image repeatedly and export every weight vector."""
+    if not hasattr(model, "expert_names"):
+        raise ValueError("Router repeatability check requires an expert-routing model")
+    if test_loader is None or len(test_loader.dataset) == 0:
+        raise ValueError("Router repeatability check requires a non-empty test split")
+    if not hasattr(test_loader.dataset, "samples"):
+        raise ValueError("Test dataset does not expose image paths via .samples")
+    if repeats <= 1:
+        raise ValueError("Router repeatability check requires at least two repeats")
+    if class_name not in class_names:
+        raise ValueError(
+            f"Unknown repeatability class {class_name!r}; choose from {class_names}"
+        )
+
+    class_index = class_names.index(class_name)
+    samples = test_loader.dataset.samples
+    candidates = [
+        index for index, sample in enumerate(samples)
+        if int(sample[1]) == class_index
+    ]
+    if not candidates:
+        raise ValueError(f"Test split contains no images for class {class_name}")
+    selected_index = random.Random(seed).choice(candidates)
+    image_path, stored_label = samples[selected_index][:2]
+
+    internal_names = tuple(model.expert_names)
+    missing = [name for _label, name in PAPER_EXPERT_ORDER if name not in internal_names]
+    if missing:
+        raise ValueError(f"Checkpoint is missing required experts: {missing}")
+    paper_columns = [
+        (paper_label, name, internal_names.index(name))
+        for paper_label, name in PAPER_EXPERT_ORDER
+    ]
+
+    model.eval()
+    rows = []
+    vectors = []
+    for repeat_index in range(repeats):
+        # Fetch and transform the same dataset item independently on every pass.
+        image, label = test_loader.dataset[selected_index]
+        if int(label) != int(stored_label):
+            raise RuntimeError("Repeated test image/label alignment failed")
+        result = model(image.unsqueeze(0).to(device))
+        if not isinstance(result, dict) or result.get("router_weights") is None:
+            raise ValueError("Model forward pass did not return router_weights")
+        weights = result["router_weights"][0]
+        prediction = int(result["logits"].argmax(dim=1)[0])
+        vector = torch.stack([
+            weights[internal_index]
+            for _paper_label, _name, internal_index in paper_columns
+        ]).detach().cpu()
+        vectors.append(vector)
+        row = {
+            "repeat": repeat_index + 1,
+            "image_path": image_path,
+            "image_name": os.path.basename(image_path),
+            "true_class": class_names[int(label)],
+            "predicted_class": class_names[prediction],
+        }
+        for column_index, (paper_label, name, _internal_index) in enumerate(
+            paper_columns
+        ):
+            row[paper_label] = float(vector[column_index])
+        row["weight_sum"] = float(vector.sum())
+        rows.append(row)
+
+    matrix = torch.stack(vectors)
+    reference = matrix[0]
+    max_abs_deviation = float((matrix - reference).abs().max())
+    exactly_identical = bool(torch.equal(matrix, reference.expand_as(matrix)))
+
+    os.makedirs(save_dir, exist_ok=True)
+    output_path = os.path.join(
+        save_dir, f"{model_label}_router_repeatability.md",
+    )
+    weight_fields = [paper_label for paper_label, _name, _index in paper_columns]
+    report = [
+        "# Router repeatability check",
+        "",
+        f"- Image: `{image_path}`",
+        f"- True class: {class_name}",
+        f"- Independent forwards: {repeats}",
+        f"- Exactly identical: {exactly_identical}",
+        f"- Maximum absolute weight deviation: {max_abs_deviation:.12g}",
+        "",
+        "| Repeat | Predicted | " + " | ".join(weight_fields) + " | Sum |",
+        "|---:|---|" + "---:|" * (len(weight_fields) + 1),
+    ]
+    for row in rows:
+        values = " | ".join(f"{row[field]:.9f}" for field in weight_fields)
+        report.append(
+            f"| {row['repeat']} | {row['predicted_class']} | {values} | "
+            f"{row['weight_sum']:.9f} |"
+        )
+    with open(output_path, "w", encoding="utf-8") as file:
+        file.write("\n".join(report) + "\n")
+
+    print("\nROUTER REPEATABILITY CHECK:")
+    print(f"  Image: {image_path}")
+    print(f"  True class: {class_name} | independent forwards: {repeats}")
+    for row in rows:
+        values = " | ".join(
+            f"{paper_label}={row[paper_label]:.9f}"
+            for paper_label, _name, _index in paper_columns
+        )
+        print(
+            f"  repeat={row['repeat']:02d} | pred={row['predicted_class']:<4} | "
+            f"{values} | sum={row['weight_sum']:.9f}"
+        )
+    print(f"  Exactly identical: {exactly_identical}")
+    print(f"  Maximum absolute weight deviation: {max_abs_deviation:.12g}")
+    print(f"Saved repeated router weights: {output_path}")
+    return {
+        "image_path": image_path,
+        "rows": rows,
+        "exactly_identical": exactly_identical,
+        "max_abs_deviation": max_abs_deviation,
+    }
 
 
 def evaluate_all_splits(model, train_loader, val_loader, test_loader, criterion, device, num_classes,
@@ -70,6 +382,14 @@ def run_expert_diagnostics(model, val_loader, test_loader, device, num_classes,
             f"  Router entropy: {report['router_entropy']:.4f} / "
             f"{report['maximum_entropy']:.4f}"
         )
+        if "raw_router_entropy" in report and abs(
+            report["raw_router_entropy"] - report["router_entropy"]
+        ) > 1e-6:
+            print(
+                f"  Raw adaptive-router entropy: "
+                f"{report['raw_router_entropy']:.4f} / "
+                f"{report['maximum_entropy']:.4f}"
+            )
         if "baseline_path" in report:
             baseline = report["baseline_path"]
             print(

@@ -1,6 +1,5 @@
 import argparse
 import os
-import csv
 import json
 import sys
 
@@ -61,9 +60,12 @@ from src.train import train_model
 from src.utils import (
     calibrate_router_temperature,
     calibrate_static_expert_fusion,
+    evaluate_complete_expert_fusion_ablation,
 )
 from src.evaluate import (
     evaluate_all_splits,
+    export_router_repeatability_check,
+    export_router_sanity_check,
     run_expert_diagnostics,
     run_oracle_diagnostics,
     run_test_evaluation,
@@ -303,59 +305,119 @@ def get_milk10k_paired_loaders(
     )
 
 
-CSV_FIELDS = [
-    "model", "dataset", "attention", "batch_size", "epochs", "lr", "split",
-    "accuracy", "precision", "recall", "balanced_accuracy", "malignant_recall",
-    "f1", "specificity", "loss", "macro_auc",
-]
+RESULT_METRICS = (
+    ("loss", "Loss"),
+    ("accuracy", "Accuracy"),
+    ("precision", "Macro precision"),
+    ("recall", "Macro recall"),
+    ("balanced_accuracy", "Balanced accuracy"),
+    ("malignant_recall", "Malignant recall"),
+    ("f1", "Macro F1"),
+    ("specificity", "Macro specificity"),
+    ("macro_auc", "Macro ROC-AUC"),
+)
 
 
-def save_results_csv(results, filepath, model_name, dataset_name, attention, batch_size, epochs, lr):
+def _format_result(value):
+    if value is None:
+        return "—"
+    try:
+        return f"{float(value):.4f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def save_results_markdown(results, filepath, config, checkpoint_path):
+    """Write one self-contained, human-readable report for one run."""
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    available_splits = [
+        split for split in ("train", "validation", "test") if split in results
+    ]
 
-    rows = []
-    for split in ["train", "validation", "test"]:
-        if split in results:
-            row = {
-                "model": model_name,
-                "dataset": dataset_name,
-                "attention": attention,
-                "batch_size": batch_size,
-                "epochs": epochs,
-                "lr": lr,
-                "split": split,
-            }
-            row.update(results[split])
-            rows.append(row)
+    lines = [
+        f"# Experiment: {config['run_label']}",
+        "",
+        "## Configuration",
+        "",
+        "| Setting | Value |",
+        "|---|---|",
+    ]
+    for label, key in (
+        ("Dataset", "dataset"),
+        ("Model", "model"),
+        ("Backbone", "backbone"),
+        ("Attention", "attention"),
+        ("Branch attention", "expert_attention"),
+        ("Image size", "image_size"),
+        ("Batch size", "batch_size"),
+        ("Maximum epochs", "epochs"),
+        ("Learning rate", "learning_rate"),
+        ("Loss", "loss"),
+        ("Seed", "seed"),
+        ("Test-time augmentation", "tta"),
+    ):
+        lines.append(f"| {label} | {config[key]} |")
 
-    file_exists = os.path.exists(filepath)
-    if file_exists:
-        with open(filepath, newline="") as existing_file:
-            reader = csv.DictReader(existing_file)
-            existing_fields = reader.fieldnames or []
-            existing_rows = list(reader)
-        if existing_fields != CSV_FIELDS:
-            # Preserve prior experiments while evolving the metrics schema.
-            temp_path = f"{filepath}.schema-update"
-            with open(temp_path, "w", newline="") as migrated_file:
-                writer = csv.DictWriter(migrated_file, fieldnames=CSV_FIELDS, extrasaction="ignore")
-                writer.writeheader()
-                writer.writerows(existing_rows)
-            os.replace(temp_path, filepath)
-            print(f"Updated results CSV schema while preserving {len(existing_rows)} existing rows")
-    with open(filepath, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
-        if not file_exists:
-            writer.writeheader()
-        writer.writerows(rows)
+    lines.extend([
+        "",
+        "## Evaluation protocol",
+        "",
+        "The checkpoint with the minimum validation loss is selected. The test "
+        "split is not used for training or model selection and is evaluated only "
+        "after the selected checkpoint is loaded.",
+        "",
+        "## Results",
+        "",
+        "| Metric | " + " | ".join(split.title() for split in available_splits) + " |",
+        "|---|" + "---|" * len(available_splits),
+    ])
+    for key, label in RESULT_METRICS:
+        values = [_format_result(results[split].get(key)) for split in available_splits]
+        if any(value != "—" for value in values):
+            lines.append(f"| {label} | " + " | ".join(values) + " |")
 
-    print(f"\nResults appended to {filepath}")
+    lines.extend(["", "## Interpretation", ""])
+    test = results.get("test")
+    validation = results.get("validation")
+    train = results.get("train")
+    if test:
+        lines.append(
+            "The locked test evaluation achieved "
+            f"{_format_result(test.get('accuracy'))} accuracy, "
+            f"{_format_result(test.get('balanced_accuracy'))} balanced accuracy, "
+            f"and {_format_result(test.get('f1'))} macro F1."
+        )
+    else:
+        lines.append(
+            "This was a validation-only run, so no test result is reported."
+        )
+    if validation and test and validation.get("accuracy") is not None and test.get("accuracy") is not None:
+        gap = float(validation["accuracy"]) - float(test["accuracy"])
+        lines.append(f"The validation-to-test accuracy difference is {gap:+.4f}.")
+    if train and validation and train.get("accuracy") is not None and validation.get("accuracy") is not None:
+        gap = float(train["accuracy"]) - float(validation["accuracy"])
+        lines.append(f"The train-to-validation accuracy difference is {gap:+.4f}.")
+    if test and test.get("accuracy") is not None and test.get("balanced_accuracy") is not None:
+        imbalance_gap = float(test["accuracy"]) - float(test["balanced_accuracy"])
+        if imbalance_gap >= 0.05:
+            lines.append(
+                "The accuracy is materially higher than balanced accuracy "
+                f"(difference {imbalance_gap:.4f}), indicating that class imbalance "
+                "should be considered when interpreting the result."
+            )
 
-
-def save_history_json(history, filepath):
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    with open(filepath, "w") as f:
-        json.dump(history, f, indent=2)
+    lines.extend([
+        "",
+        "## Artifact",
+        "",
+        f"Selected checkpoint: `{checkpoint_path}`",
+        "",
+    ])
+    temporary_path = f"{filepath}.tmp"
+    with open(temporary_path, "w", encoding="utf-8") as file:
+        file.write("\n".join(lines))
+    os.replace(temporary_path, filepath)
+    print(f"\nSaved experiment report: {filepath}")
 
 
 def main():
@@ -524,6 +586,30 @@ def main():
                         help="Router supervision from per-expert baseline-loss reduction")
     parser.add_argument("--router-gain-temperature", type=float, default=0.25,
                         help="Soft-target temperature for expert correction gains")
+    parser.add_argument(
+        "--router-adaptive-strength", type=float, default=1.0,
+        help=(
+            "Fraction of the final routing weight supplied by the learned "
+            "sample-dependent router; the remainder is a uniform expert prior"
+        ),
+    )
+    parser.add_argument(
+        "--router-disagreement",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Include pairwise cosine/absolute disagreement descriptors in "
+            "five_expert_moe routing; --no-router-disagreement zeros only "
+            "those descriptors for a parameter-matched router ablation"
+        ),
+    )
+    parser.add_argument(
+        "--router-inference-adaptive-strength", type=float, default=None,
+        help=(
+            "Optional fixed adaptive strength applied only after loading the "
+            "minimum-validation-loss checkpoint for final evaluation"
+        ),
+    )
     parser.add_argument("--expert-mode", type=str, default="shared_base",
                         choices=["shared_base", "multi_layer"],
                         help="Expert mode: shared_base (1 backbone + lightweight branches) or multi_layer (1 backbone, 3 layers)")
@@ -588,8 +674,57 @@ def main():
     parser.add_argument("--evaluate-only", action="store_true",
                         help="Load this run's existing minimum-validation-loss checkpoint and evaluate without retraining")
     parser.add_argument(
+        "--evaluation-checkpoint", type=str, default="",
+        help=(
+            "With --evaluate-only, load this locked checkpoint while writing "
+            "metrics and figures under the requested run name"
+        ),
+    )
+    parser.add_argument(
+        "--fusion-ablation-only", action="store_true",
+        help=(
+            "With --evaluate-only, report equal-logit, equal-probability, "
+            "validation-fitted static-logit, and learned-router fusion from "
+            "one locked complete-expert checkpoint, then exit"
+        ),
+    )
+    parser.add_argument(
         "--expert-visualization-only", action="store_true",
         help="With --evaluate-only, load the locked checkpoint and generate only expert Grad-CAM artifacts",
+    )
+    parser.add_argument(
+        "--router-sanity-check",
+        action="store_true",
+        help=(
+            "With --evaluate-only, export per-image routing weights for a "
+            "class-balanced subset of the test split, then exit"
+        ),
+    )
+    parser.add_argument(
+        "--router-sanity-samples-per-class",
+        type=int,
+        default=5,
+        help="Number of deterministic test images selected from each class",
+    )
+    parser.add_argument(
+        "--router-repeatability-check",
+        action="store_true",
+        help=(
+            "With --evaluate-only, repeatedly forward one fixed test image "
+            "and export every routing-weight vector, then exit"
+        ),
+    )
+    parser.add_argument(
+        "--router-repeatability-class",
+        type=str,
+        default="MEL",
+        help="True class from which to select the repeated test image",
+    )
+    parser.add_argument(
+        "--router-repeatability-count",
+        type=int,
+        default=20,
+        help="Number of independent inference passes for the same image",
     )
     parser.add_argument("--augment-style", type=str, default=None,
                         choices=["balanced", "seefnet", "skin", "skin_focus", "pad_clinical", "milk_pair"],
@@ -805,7 +940,8 @@ def main():
             print(
                 f"Five-expert routing: expert_dropout={args.expert_dropout} | "
                 f"router_gain={args.router_gain_weight}@"
-                f"{args.router_gain_temperature}"
+                f"{args.router_gain_temperature} | "
+                f"adaptive_strength={args.router_adaptive_strength}"
             )
         elif args.model in (
             "lesion_moe", "oracle_moe", "paired_lesion_moe",
@@ -829,6 +965,7 @@ def main():
                 f"distill={args.residual_distill_weight} | "
                 f"router_gain={args.router_gain_weight}@"
                 f"{args.router_gain_temperature} | "
+                f"adaptive_strength={args.router_adaptive_strength} | "
                 f"oracle_router={args.oracle_router_version}"
             )
         print(f"Projection dim: {args.proj_dim}")
@@ -845,6 +982,7 @@ def main():
     attention_arg = args.attention if args.attention != "none" else None
     use_imagenet_pretrained = not bool(
         args.init_checkpoint or args.backbone_init_checkpoint
+        or args.evaluation_checkpoint
     )
     if args.model in (
         "lesion_moe", "oracle_moe", "paired_lesion_moe",
@@ -897,8 +1035,17 @@ def main():
             if args.model == "paired_lesion_moe":
                 residual_kwargs["paired_baseline_only"] = args.paired_baseline_only
                 residual_kwargs["enabled_experts"] = args.enabled_experts
+                residual_kwargs["router_adaptive_strength"] = (
+                    args.router_adaptive_strength
+                )
             elif args.model == "five_expert_moe":
                 residual_kwargs["enabled_experts"] = args.enabled_experts
+                residual_kwargs["router_adaptive_strength"] = (
+                    args.router_adaptive_strength
+                )
+                residual_kwargs["router_use_disagreement"] = (
+                    args.router_disagreement
+                )
         model, head_name = residual_factory(**residual_kwargs)
     elif is_expert_fusion:
         expert_kwargs = dict(
@@ -1132,8 +1279,10 @@ def main():
             parser.error("--run-name may contain only letters, numbers, dot, underscore, and hyphen")
         model_label = f"{model_label}_{args.run_name}"
     model_save_dir = os.path.join(args.output_dir, "models", args.dataset, model_label)
-    results_dir = os.path.join(args.output_dir, "results", args.dataset)
-    results_csv = os.path.join(results_dir, "results.csv")
+    results_dir = os.path.join(
+        args.output_dir, "results", args.dataset, model_label,
+    )
+    results_markdown = os.path.join(results_dir, "results.md")
 
     train_lr = override_default("lr")
     train_weight_decay = override_default("weight_decay")
@@ -1202,6 +1351,15 @@ def main():
         parser.error("--expert-dropout must be in [0, 1)")
     if args.router_gain_temperature <= 0:
         parser.error("--router-gain-temperature must be positive")
+    if not 0.0 <= args.router_adaptive_strength <= 1.0:
+        parser.error("--router-adaptive-strength must be between 0 and 1")
+    if (
+        args.router_inference_adaptive_strength is not None
+        and not 0.0 <= args.router_inference_adaptive_strength <= 1.0
+    ):
+        parser.error(
+            "--router-inference-adaptive-strength must be between 0 and 1"
+        )
     if args.correction_max_scale < 0:
         parser.error("--correction-max-scale must be non-negative")
     if args.correction_ramp_epochs < 0:
@@ -1237,9 +1395,14 @@ def main():
         f"monitor={monitor_metric}/{monitor_mode} | freeze_epochs={train_freeze_epochs}"
     )
 
+    if args.evaluation_checkpoint and not args.evaluate_only:
+        parser.error("--evaluation-checkpoint requires --evaluate-only")
+
     if args.evaluate_only:
-        best_model_path = os.path.join(
-            model_save_dir, f"{model_label}_best.pth",
+        best_model_path = (
+            args.evaluation_checkpoint
+            if args.evaluation_checkpoint
+            else os.path.join(model_save_dir, f"{model_label}_best.pth")
         )
         if not os.path.isfile(best_model_path):
             parser.error(
@@ -1317,11 +1480,106 @@ def main():
             num_classes, results_dir, model_label, tta=eval_tta,
         )
 
-    best_model_path = os.path.join(model_save_dir, f"{model_label}_best.pth")
+    best_model_path = (
+        args.evaluation_checkpoint
+        if args.evaluation_checkpoint
+        else os.path.join(model_save_dir, f"{model_label}_best.pth")
+    )
     if os.path.exists(best_model_path):
         print(f"\nLoading best model from {best_model_path}")
         model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
         restore_protected_baseline()
+
+    if args.router_inference_adaptive_strength is not None:
+        if not hasattr(model, "router_adaptive_strength"):
+            parser.error(
+                "--router-inference-adaptive-strength requires a bounded "
+                "expert-routing model"
+            )
+        training_strength = float(model.router_adaptive_strength)
+        model.router_adaptive_strength = float(
+            args.router_inference_adaptive_strength
+        )
+        print(
+            "Final-inference router shrinkage: "
+            f"training strength={training_strength:.3f} -> "
+            f"inference strength={model.router_adaptive_strength:.3f}"
+        )
+
+    if args.router_sanity_check:
+        if not args.evaluate_only:
+            parser.error("--router-sanity-check requires --evaluate-only")
+        if evaluation_test_loader is None:
+            parser.error("Router sanity check requires an available test split")
+        if args.model != "five_expert_moe":
+            parser.error("Router sanity check currently requires five_expert_moe")
+        export_router_sanity_check(
+            model,
+            evaluation_test_loader,
+            device,
+            class_names,
+            results_dir,
+            model_label,
+            samples_per_class=args.router_sanity_samples_per_class,
+            seed=args.seed,
+        )
+        print("\nRouter sanity check complete; the model was not retrained.")
+        return
+
+    if args.router_repeatability_check:
+        if not args.evaluate_only:
+            parser.error("--router-repeatability-check requires --evaluate-only")
+        if evaluation_test_loader is None:
+            parser.error("Router repeatability check requires a test split")
+        if args.model != "five_expert_moe":
+            parser.error(
+                "Router repeatability check currently requires five_expert_moe"
+            )
+        export_router_repeatability_check(
+            model,
+            evaluation_test_loader,
+            device,
+            class_names,
+            results_dir,
+            model_label,
+            class_name=args.router_repeatability_class,
+            repeats=args.router_repeatability_count,
+            seed=args.seed,
+        )
+        print("\nRouter repeatability check complete; the model was not retrained.")
+        return
+
+    if args.fusion_ablation_only:
+        if not args.evaluate_only:
+            parser.error("--fusion-ablation-only requires --evaluate-only")
+        if args.model != "five_expert_moe":
+            parser.error(
+                "--fusion-ablation-only currently requires five_expert_moe"
+            )
+        report = evaluate_complete_expert_fusion_ablation(
+            model, val_loader, evaluation_test_loader, device,
+            num_classes, tta=eval_tta,
+        )
+        os.makedirs(results_dir, exist_ok=True)
+        report_path = os.path.join(
+            results_dir, f"{model_label}_fusion_ablation.json",
+        )
+        with open(report_path, "w") as file:
+            json.dump(report, file, indent=2)
+        print("\nFUSION ABLATION (validation-fitted static weights):")
+        for name, metrics in report["test"].items():
+            print(
+                f"  {name:<28} Acc={metrics['accuracy']:.4f} | "
+                f"F1={metrics['f1']:.4f} | "
+                f"BAcc={metrics['balanced_accuracy']:.4f}"
+            )
+        weights = ", ".join(
+            f"{name}={weight:.4f}"
+            for name, weight in report["static_expert_weights"].items()
+        )
+        print(f"  Static weights: {weights}")
+        print(f"Saved fusion ablation: {report_path}")
+        return
 
     if args.expert_visualization_only:
         if not args.evaluate_only:
@@ -1424,19 +1682,26 @@ def main():
         if "test" in final_results:
             final_results["test"].update(test_metrics)
 
-    save_results_csv(
-        final_results, results_csv,
-        model_label if is_dual_fusion else args.model,
-        args.dataset, args.attention,
-        args.batch_size, args.epochs, train_lr,
+    save_results_markdown(
+        final_results,
+        results_markdown,
+        {
+            "run_label": model_label,
+            "dataset": args.dataset,
+            "model": args.model,
+            "backbone": args.backbone1,
+            "attention": args.attention,
+            "expert_attention": args.expert_attention,
+            "image_size": args.img_size,
+            "batch_size": args.batch_size,
+            "epochs": args.epochs,
+            "learning_rate": train_lr,
+            "loss": loss_type,
+            "seed": args.seed,
+            "tta": "enabled" if eval_tta else "disabled",
+        },
+        best_model_path,
     )
-
-    if final_metrics is not None:
-        history_path = os.path.join(
-            args.output_dir, "results", args.dataset,
-            f"{model_label}_bs{args.batch_size}_ep{args.epochs}_lr{train_lr}_history.json",
-        )
-        save_history_json(final_metrics["history"], history_path)
 
     print(f"\n{'='*60}")
     print("Training complete!")

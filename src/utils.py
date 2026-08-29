@@ -282,6 +282,7 @@ def compute_expert_diagnostics(model, dataloader, device, num_classes,
     """Collect standalone expert and sample-level routing diagnostics."""
     model.eval()
     weights_batches = []
+    probability_batches = []
     active_batches = []
     logits_batches = []
     embedding_batches = []
@@ -296,6 +297,9 @@ def compute_expert_diagnostics(model, dataloader, device, num_classes,
         if details.get("router_weights") is None:
             return None
         weights_batches.append(details["router_weights"].cpu())
+        probabilities = details.get("router_probabilities")
+        if probabilities is not None:
+            probability_batches.append(probabilities.cpu())
         active = details.get("router_active")
         if active is not None:
             active_batches.append(active.cpu())
@@ -313,6 +317,9 @@ def compute_expert_diagnostics(model, dataloader, device, num_classes,
         return None
 
     weights = torch.cat(weights_batches)
+    raw_probabilities = (
+        torch.cat(probability_batches) if probability_batches else None
+    )
     active = torch.cat(active_batches) if active_batches else (weights > 0).float()
     expert_logits = torch.cat(logits_batches)
     embeddings = F.normalize(torch.cat(embedding_batches), dim=-1)
@@ -385,6 +392,26 @@ def compute_expert_diagnostics(model, dataloader, device, num_classes,
         "mean_cosine_similarity": similarity_rows,
         "class_conditional_routing": class_conditional,
     }
+    if raw_probabilities is not None:
+        raw_argmax = raw_probabilities.argmax(dim=1)
+        report["raw_router_entropy"] = round(float(-(
+            raw_probabilities
+            * raw_probabilities.clamp_min(1e-8).log()
+        ).sum(dim=1).mean()), 6)
+        report["raw_routing"] = {
+            name: {
+                "mean_probability": round(
+                    float(raw_probabilities[:, index].mean()), 6,
+                ),
+                "std_probability": round(
+                    float(raw_probabilities[:, index].std(unbiased=False)), 6,
+                ),
+                "argmax_frequency": round(
+                    float((raw_argmax == index).float().mean()), 6,
+                ),
+            }
+            for index, name in enumerate(names)
+        }
     if baseline_metrics is not None:
         report["baseline_path"] = baseline_metrics
     if correction_metrics is not None:
@@ -729,6 +756,135 @@ def calibrate_static_expert_fusion(
         "calibrated_static_fusion": report(best["logits"]),
     }
     return calibration
+
+
+def evaluate_complete_expert_fusion_ablation(
+    model, val_loader, test_loader, device, num_classes, tta=False,
+):
+    """Evaluate post-hoc fusion controls for complete-expert MoE models.
+
+    Global static logit weights are fitted exclusively on validation
+    cross-entropy. Equal-logit and equal-probability fusion have no fitted
+    parameters. The official test labels are used only after the static
+    weights have been locked.
+    """
+    if test_loader is None:
+        raise ValueError("Fusion ablation requires an available test split")
+
+    def collect(loader):
+        learned_batches = []
+        expert_batches = []
+        label_batches = []
+        model.eval()
+        with torch.no_grad():
+            for images, labels in loader:
+                learned, _, details = _forward_with_tta_details(
+                    model, images.to(device), tta=tta,
+                )
+                experts = details.get("expert_logits")
+                if experts is None:
+                    raise ValueError(
+                        "Model did not expose complete expert logits"
+                    )
+                learned_batches.append(learned.cpu())
+                expert_batches.append(experts.cpu())
+                label_batches.append(labels.cpu())
+        if not label_batches:
+            raise ValueError("Fusion ablation received an empty data loader")
+        return (
+            torch.cat(learned_batches),
+            torch.cat(expert_batches),
+            torch.cat(label_batches),
+        )
+
+    val_learned, val_experts, val_labels = collect(val_loader)
+    test_learned, test_experts, test_labels = collect(test_loader)
+    num_experts = val_experts.size(1)
+    if test_experts.size(1) != num_experts:
+        raise ValueError("Validation/test expert counts do not match")
+
+    # The objective is convex in simplex weights. Multiple deterministic
+    # starts make the softmax parameterization robust near simplex boundaries.
+    candidates = []
+    starts = [torch.zeros(num_experts)]
+    for index in range(num_experts):
+        start = torch.zeros(num_experts)
+        start[index] = 2.0
+        starts.append(start)
+    for start in starts:
+        weight_logits = start.clone().requires_grad_(True)
+        optimizer = torch.optim.LBFGS(
+            (weight_logits,), lr=1.0, max_iter=200,
+            tolerance_grad=1e-10, tolerance_change=1e-12,
+            line_search_fn="strong_wolfe",
+        )
+
+        def closure():
+            optimizer.zero_grad()
+            weights = torch.softmax(weight_logits, dim=0)
+            logits = (val_experts * weights.view(1, -1, 1)).sum(dim=1)
+            loss = F.cross_entropy(logits, val_labels)
+            loss.backward()
+            return loss
+
+        optimizer.step(closure)
+        with torch.no_grad():
+            weights = torch.softmax(weight_logits, dim=0)
+            logits = (val_experts * weights.view(1, -1, 1)).sum(dim=1)
+            loss = float(F.cross_entropy(logits, val_labels))
+        candidates.append((loss, weights.detach().clone()))
+    static_val_loss, static_weights = min(
+        candidates, key=lambda candidate: candidate[0],
+    )
+
+    def metrics_from_predictions(labels, predictions):
+        return compute_metrics(
+            labels.numpy(), predictions.numpy(), num_classes,
+        )
+
+    def report(learned, experts, labels):
+        equal_logit = experts.mean(dim=1)
+        equal_probability = F.softmax(experts, dim=-1).mean(dim=1)
+        static_logit = (
+            experts * static_weights.view(1, -1, 1)
+        ).sum(dim=1)
+        return {
+            "equal_logit_average": metrics_from_predictions(
+                labels, equal_logit.argmax(dim=1),
+            ),
+            "equal_probability_average": metrics_from_predictions(
+                labels, equal_probability.argmax(dim=1),
+            ),
+            "static_logit_weights": metrics_from_predictions(
+                labels, static_logit.argmax(dim=1),
+            ),
+            "disagreement_router": metrics_from_predictions(
+                labels, learned.argmax(dim=1),
+            ),
+        }
+
+    names = list(getattr(model, "expert_names", ()))
+    if len(names) != num_experts:
+        names = [f"expert{index}" for index in range(num_experts)]
+    return {
+        "protocol": {
+            "static_weight_selection_split": "validation",
+            "static_weight_selection_metric": "cross_entropy",
+            "official_test_used_for_selection": False,
+            "tta": bool(tta),
+            "num_validation_samples": int(val_labels.numel()),
+            "num_test_samples": int(test_labels.numel()),
+        },
+        "static_validation_cross_entropy": round(static_val_loss, 8),
+        "static_expert_weights": {
+            name: round(float(static_weights[index]), 8)
+            for index, name in enumerate(names)
+        },
+        "validation": report(
+            val_learned, val_experts, val_labels,
+        ),
+        "test": report(test_learned, test_experts, test_labels),
+    }
 
 
 @torch.no_grad()

@@ -310,12 +310,13 @@ class DisagreementAwareRouter(nn.Module):
     """Score each expert using its representation, disagreement, and context."""
 
     def __init__(self, proj_dim, num_experts, hidden_dim, dropout,
-                 temperature, routing_mode):
+                 temperature, routing_mode, use_disagreement=True):
         super().__init__()
         if routing_mode not in ("soft", "top2", "top1"):
             raise ValueError(f"Unknown routing mode: {routing_mode}")
         self.temperature = temperature
         self.routing_mode = routing_mode
+        self.use_disagreement = bool(use_disagreement)
         comparison_dim = max(32, proj_dim // 2)
         embedding_dim = min(16, hidden_dim)
         self.comparison_projection = nn.Sequential(
@@ -362,8 +363,16 @@ class DisagreementAwareRouter(nn.Module):
         identity = self.expert_embedding.unsqueeze(0).expand(
             pooled.shape[0], -1, -1,
         )
+        # Keep the descriptor slots and scorer parameter count identical in
+        # the no-disagreement control. Zeroing only these two values produces
+        # a clean ablation: expert features, global context, expert identity,
+        # and all trainable router dimensions remain unchanged.
+        router_disagreement = (
+            disagreement if self.use_disagreement
+            else torch.zeros_like(disagreement)
+        )
         router_input = torch.cat(
-            [pooled, disagreement, global_context, identity], dim=-1,
+            [pooled, router_disagreement, global_context, identity], dim=-1,
         )
         logits = self.scorer(router_input).squeeze(-1)
         probabilities = F.softmax(

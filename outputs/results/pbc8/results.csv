@@ -1,7 +1,0 @@
-model,dataset,batch_size,epochs,lr,split,accuracy,precision,recall,f1,specificity,loss
-mobilenetv2,pbc8,32,2,0.001,train,0.9543,0.9462,0.9565,0.9508,0.9935,0.0549
-mobilenetv2,pbc8,32,2,0.001,validation,0.9578,0.9573,0.9559,0.9565,0.9938,0.0531
-mobilenetv2,pbc8,32,2,0.001,test,0.9563,0.9544,0.9549,0.9546,0.9936,0.0525
-mobilenetv2,pbc8,none,32,2,0.001,train,0.8155,0.7925,0.8014,0.7962,0.9734,0.328,0.9683
-mobilenetv2,pbc8,none,32,2,0.001,validation,0.7822,0.7688,0.752,0.7536,0.9686,0.466,0.9683
-mobilenetv2,pbc8,none,32,2,0.001,test,0.7917,0.7861,0.7597,0.7662,0.9698,0.4436,0.9683

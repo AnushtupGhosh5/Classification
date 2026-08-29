@@ -1,69 +1,72 @@
 #!/bin/bash
-set -e
+set -Eeuo pipefail
 
-# Independent repeat of the final MILK10k paired-lesion hybrid-attention MoE.
+# Matched PAD-UFES-20 backbone baselines.
 #
-# This keeps the original lesion-level split (split seed 42) while changing
-# only training randomness (seed 43). It therefore measures repeatability on
-# exactly the same train/validation/local-test lesions. The existing seed-42
-# checkpoint is preserved under its original run name.
+# DenseNet-121 and ResNet-101 use the same patient-disjoint split and training
+# recipe as the existing ConvNeXt-Tiny, EfficientNet-B0/B1, ResNet-50, and
+# MobileNetV2 comparisons. The best checkpoint is selected by minimum
+# validation loss; the local test split is evaluated only after training.
 
-REFERENCE_CHECKPOINT="outputs/models/milk10k/paired_lesion_moe_convnext_tiny_soft_milk10k_paired_five_expert_v1/paired_lesion_moe_convnext_tiny_soft_milk10k_paired_five_expert_v1_best.pth"
+MODELS=(
+    densenet121
+    resnet101
+)
 
-if [[ ! -f "$REFERENCE_CHECKPOINT" ]]; then
-    echo "Missing original MILK10k hybrid checkpoint: $REFERENCE_CHECKPOINT"
-    exit 1
-fi
+EPOCHS=70
+BATCH_SIZE=8
+IMAGE_SIZE=384
+LEARNING_RATE=0.0001
+SEED=42
+
+for MODEL in "${MODELS[@]}"; do
+    RUN_NAME="pad_ufes20_${MODEL}_patient384_baseline_v1"
+
+    echo
+    echo "============================================================"
+    echo "PAD-UFES-20 matched baseline: ${MODEL}"
+    echo "Run name:    ${RUN_NAME}"
+    echo "Image size:  ${IMAGE_SIZE}"
+    echo "Batch size:  ${BATCH_SIZE}"
+    echo "Epochs:      ${EPOCHS}"
+    echo "Checkpoint:  minimum validation loss"
+    echo "Test:        evaluated after loading the best checkpoint"
+    echo "============================================================"
+
+    python src/main.py \
+        --output-dir outputs \
+        --run-name "${RUN_NAME}" \
+        --dataset pad_ufes20 \
+        --model "${MODEL}" \
+        --attention none \
+        --epochs "${EPOCHS}" \
+        --batch-size "${BATCH_SIZE}" \
+        --img-size "${IMAGE_SIZE}" \
+        --augment-style pad_clinical \
+        --lr "${LEARNING_RATE}" \
+        --weight-decay 0.0001 \
+        --scheduler cosine \
+        --loss ce \
+        --label-smoothing 0.05 \
+        --classifier-dropout 0.30 \
+        --freeze-epochs 0 \
+        --no-weighted-sampler \
+        --sampler-mode sqrt \
+        --class-weight-power 0.25 \
+        --mixup-alpha 0.20 \
+        --mix-prob 0.25 \
+        --ema \
+        --ema-decay 0.999 \
+        --early-stopping \
+        --es-patience 15 \
+        --tta \
+        --no-validation-only \
+        --seed "${SEED}" \
+        --amp
+done
 
 echo
 echo "============================================================"
-echo "MILK10k final paired-lesion hybrid-attention MoE repeat"
-echo "Split seed: 42 | Training seed: 43"
-echo "Experts: texture morphology semantic color boundary"
+echo "PAD-UFES-20 DenseNet-121 and ResNet-101 baselines complete"
+echo "Reports: outputs/results/pad_ufes20/<model>_<run-name>/results.md"
 echo "============================================================"
-
-python src/main.py \
-    --output-dir outputs \
-    --run-name milk10k_paired_five_expert_hybrid_repeat_seed43_v1 \
-    --dataset milk10k \
-    --model paired_lesion_moe \
-    --backbone1 convnext_tiny \
-    --enabled-experts texture morphology semantic color boundary \
-    --attention none \
-    --expert-attention hybrid \
-    --routing-mode soft \
-    --proj-dim 128 \
-    --branch-depth 1 \
-    --router-hidden 128 \
-    --router-dropout 0.10 \
-    --router-temperature 0.70 \
-    --router-lr-scale 1.0 \
-    --expert-aux-weight 0.15 \
-    --expert-diversity-weight 0.005 \
-    --router-balance-weight 0.002 \
-    --expert-dropout 0.0 \
-    --epochs 50 \
-    --batch-size 8 \
-    --img-size 256 \
-    --augment-style milk_pair \
-    --milk-val-fraction 0.10 \
-    --milk-local-test-fraction 0.20 \
-    --lr 0.0003 \
-    --weight-decay 0.0001 \
-    --scheduler cosine \
-    --loss ce \
-    --label-smoothing 0.05 \
-    --classifier-dropout 0.25 \
-    --freeze-epochs 0 \
-    --weighted-sampler \
-    --sampler-mode sqrt \
-    --class-weight-power 0.25 \
-    --ema \
-    --ema-decay 0.999 \
-    --early-stopping \
-    --es-patience 15 \
-    --no-tta \
-    --no-validation-only \
-    --milk-split-seed 42 \
-    --seed 43 \
-    --amp

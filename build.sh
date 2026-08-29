@@ -8,4 +8,4 @@ docker build -t "$IMAGE_NAME" .
 
 echo ""
 echo "Build complete!"
-echo "Run with: ./run.sh --model mobilenetv2 --batch-size 32 --epochs 10 --lr 0.001"
+echo "Run the configured experiment with: ./run.sh"

@@ -1,7 +1,14 @@
-/data
-outputs/
-.torch-cache/
+/data/
+/outputs/
+/.torch-cache/
+/.venv/
+/bridge/
+/notebooks/
+/work.md
+/TARGET ARCHITECTURE.md
 **/__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
 Expert Fusion.md
-.venv
 SEEFNet_Codes
